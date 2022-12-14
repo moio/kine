@@ -29,7 +29,7 @@ const (
 var _ server.Dialect = (*Generic)(nil)
 
 var (
-	columns = "kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value"
+	Columns = "kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value"
 	revSQL  = `
 		SELECT MAX(rkv.id) AS id
 		FROM kine AS rkv`
@@ -67,7 +67,7 @@ var (
 				?
 		) AS lkv
 		ORDER BY lkv.theid ASC
-		`, revSQL, compactRevSQL, columns)
+		`, revSQL, compactRevSQL, Columns)
 )
 
 type ErrRetry func(error) bool
@@ -211,7 +211,7 @@ func Open(ctx context.Context, driverName, dataSourceName string, connPoolConfig
 			SELECT
 			0, 0, %s
 			FROM kine AS kv
-			WHERE kv.id = ?`, columns), paramCharacter, numbered),
+			WHERE kv.id = ?`, Columns), paramCharacter, numbered),
 
 		GetCurrentSQL:        q(fmt.Sprintf(listSQL, ""), paramCharacter, numbered),
 		ListRevisionStartSQL: q(fmt.Sprintf(listSQL, "AND mkv.id <= ?"), paramCharacter, numbered),
@@ -229,7 +229,7 @@ func Open(ctx context.Context, driverName, dataSourceName string, connPoolConfig
 			WHERE
 				kv.name LIKE ? AND
 				kv.id > ?
-			ORDER BY kv.id ASC`, revSQL, compactRevSQL, columns), paramCharacter, numbered),
+			ORDER BY kv.id ASC`, revSQL, compactRevSQL, Columns), paramCharacter, numbered),
 
 		DeleteSQL: q(`
 			DELETE FROM kine AS kv

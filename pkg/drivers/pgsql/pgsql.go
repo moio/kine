@@ -3,6 +3,7 @@ package pgsql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -42,6 +43,69 @@ var (
 		`CREATE INDEX IF NOT EXISTS kine_id_deleted_index ON kine (id,deleted)`,
 		`CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)`,
+
+		`CREATE TABLE IF NOT EXISTS kine_latest
+			(
+				id INTEGER PRIMARY KEY,
+				name VARCHAR(630),
+				created INTEGER,
+				deleted INTEGER,
+				create_revision INTEGER,
+				prev_revision INTEGER,
+				lease INTEGER,
+				value bytea,
+				old_value bytea
+			);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS kine_latest_name_uindex ON kine_latest (name)`,
+		`CREATE INDEX IF NOT EXISTS kine_latest_name_id_index ON kine_latest (name,id)`,
+		`CREATE INDEX IF NOT EXISTS kine_latest_id_deleted_index ON kine_latest (id,deleted)`,
+		`CREATE INDEX IF NOT EXISTS kine_latest_prev_revision_index ON kine_latest (prev_revision)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS kine_latest_name_prev_revision_uindex ON kine_latest (name, prev_revision)`,
+
+		`CREATE OR REPLACE FUNCTION insert_into_kine (
+				p_name VARCHAR(630),
+				p_created INTEGER,
+				p_deleted INTEGER,
+				p_create_revision INTEGER,
+				p_prev_revision INTEGER,
+				p_lease INTEGER,
+				p_value BYTEA,
+				p_old_value BYTEA
+			)
+			RETURNS INTEGER
+			AS $$
+				DECLARE
+					new_id INTEGER;
+				BEGIN
+					INSERT INTO kine
+						(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+					VALUES
+						(p_name, p_created, p_deleted, p_create_revision, p_prev_revision, p_lease, p_value, p_old_value)
+					RETURNING id INTO new_id;
+
+					IF p_name <> 'compact_rev_key' THEN
+					   INSERT INTO kine_latest
+							(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+					   VALUES
+							(new_id, p_name, p_created, p_deleted, p_create_revision, p_prev_revision, p_lease, p_value, p_old_value)
+					   ON CONFLICT (name) DO UPDATE
+							SET id = new_id, name = p_name, created = p_created, deleted = p_deleted, create_revision = p_create_revision, prev_revision = p_prev_revision, lease = p_lease, value = p_value, old_value = p_old_value
+					   ;
+					END IF;
+					RETURN new_id;
+				END
+			$$ LANGUAGE plpgsql;`,
+		`CREATE OR REPLACE FUNCTION delete_from_kine (
+				p_id INTEGER
+			)
+		   RETURNS VOID
+		   AS $$
+				BEGIN
+					 DELETE FROM kine WHERE id = p_id;
+					 DELETE FROM kine_latest WHERE id = p_id;
+					 RETURN;
+				END
+		   $$ LANGUAGE plpgsql;`,
 	}
 	createDB = "CREATE DATABASE "
 )
@@ -93,6 +157,24 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		}
 		return err.Error()
 	}
+
+	dialect.GetCurrentSQL = q(fmt.Sprintf(`
+		SELECT (SELECT MAX(rkv.id) AS id FROM kine_latest AS rkv),
+			(SELECT MAX(crkv.prev_revision) AS prev_revision FROM kine_latest AS crkv WHERE crkv.name = 'compact_rev_key'),
+			kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
+		FROM kine_latest AS kv
+		WHERE kv.name LIKE ?
+			AND (
+				kv.deleted = 0 OR
+				?
+			)
+		ORDER BY kv.id ASC
+		`))
+
+	dialect.CountSQL = q(`SELECT (SELECT MAX(rkv.id) AS id FROM kine_latest AS rkv), COUNT(id) FROM kine_latest`)
+
+	dialect.InsertSQL = q(`SELECT insert_into_kine(?, ?, ?, ?, ?, ?, ?, ?)`)
+	dialect.DeleteSQL = q(`SELECT delete_from_kine(?)`)
 
 	if err := setup(dialect.DB); err != nil {
 		return nil, err
