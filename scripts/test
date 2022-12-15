@@ -14,19 +14,19 @@ docker ps
 
 # ---
 
-. ./scripts/test-run-sqlite
-echo "Did test-run-sqlite $?"
-
-. ./scripts/test-run-mysql
-echo "Did test-run-mysql $?"
+#. ./scripts/test-run-sqlite
+#echo "Did test-run-sqlite $?"
+#
+#. ./scripts/test-run-mysql
+#echo "Did test-run-mysql $?"
 
 . ./scripts/test-run-postgres
 echo "Did test-run-postgres $?"
 
-. ./scripts/test-run-cockroachdb
-echo "Did test-run-cockroachdb $?"
-
-. ./scripts/test-run-jetstream
-echo "Did test-jetstream $?"
+#. ./scripts/test-run-cockroachdb
+#echo "Did test-run-cockroachdb $?"
+#
+#. ./scripts/test-run-jetstream
+#echo "Did test-jetstream $?"
 
 exit 0
