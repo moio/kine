@@ -83,15 +83,13 @@ var (
 						(p_name, p_created, p_deleted, p_create_revision, p_prev_revision, p_lease, p_value, p_old_value)
 					RETURNING id INTO new_id;
 
-					IF p_name <> 'compact_rev_key' THEN
-					   INSERT INTO kine_latest
-							(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
-					   VALUES
-							(new_id, p_name, p_created, p_deleted, p_create_revision, p_prev_revision, p_lease, p_value, p_old_value)
-					   ON CONFLICT (name) DO UPDATE
-							SET id = new_id, name = p_name, created = p_created, deleted = p_deleted, create_revision = p_create_revision, prev_revision = p_prev_revision, lease = p_lease, value = p_value, old_value = p_old_value
-					   ;
-					END IF;
+					INSERT INTO kine_latest
+						(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+					VALUES
+						(new_id, p_name, p_created, p_deleted, p_create_revision, p_prev_revision, p_lease, p_value, p_old_value)
+					ON CONFLICT (name) DO UPDATE
+						SET id = new_id, name = p_name, created = p_created, deleted = p_deleted, create_revision = p_create_revision, prev_revision = p_prev_revision, lease = p_lease, value = p_value, old_value = p_old_value
+					;
 					RETURN new_id;
 				END
 			$$ LANGUAGE plpgsql;`,
