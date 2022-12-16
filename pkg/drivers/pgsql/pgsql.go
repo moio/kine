@@ -171,7 +171,8 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		ORDER BY kv.id ASC
 		`))
 
-	dialect.CountSQL = q(`SELECT (SELECT MAX(rkv.id) AS id FROM kine_latest AS rkv), COUNT(id) FROM kine_latest`)
+	// HACK: WHERE below is necessary to ignore unused parameters
+	dialect.CountSQL = q(`SELECT (SELECT MAX(rkv.id) AS id FROM kine_latest AS rkv), COUNT(id) FROM kine_latest WHERE TRUE OR (? = ?)`)
 
 	dialect.InsertSQL = q(`SELECT insert_into_kine(?, ?, ?, ?, ?, ?, ?, ?)`)
 	dialect.DeleteSQL = q(`SELECT delete_from_kine(?)`)
