@@ -169,6 +169,23 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		ORDER BY kv.id ASC
 		`))
 
+	// TESTING: assume resources do not change during pagination. This is UNSAFE in general, tried here only as proof-of-concept
+	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(`
+		SELECT (SELECT MAX(rkv.id) AS id FROM kine_latest AS rkv),
+			(SELECT MAX(crkv.prev_revision) AS prev_revision FROM kine_latest AS crkv WHERE crkv.name = 'compact_rev_key'),
+			kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
+		FROM kine_latest AS kv
+		WHERE kv.name LIKE ?
+			AND id > (
+			    SELECT id FROM kine_latest WHERE (? < 0) OR name = ? OR (? < 0)
+			)
+			AND (
+				kv.deleted = 0 OR
+				?
+			)
+		ORDER BY kv.id ASC
+		`))
+
 	// HACK: WHERE below is necessary to ignore unused parameters
 	dialect.CountSQL = q(`SELECT (SELECT MAX(rkv.id) AS id FROM kine_latest AS rkv), COUNT(id) FROM kine_latest WHERE TRUE OR (? = ?)`)
 
