@@ -117,6 +117,7 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 				?
 		) AS lkv
 		ORDER BY lkv.theid ASC
+		LIMIT %%s
 		`)
 
 	idOfKey := `(
@@ -128,12 +129,12 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 
 	// integer ranges from -2147483648 to +2147483647
 
-	dialect.GetCurrentSQL = q(fmt.Sprintf(listSQL, "2147483647", "-2147483648"))
-	dialect.GetCurrentSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "2147483647", "-2147483648"))
-	dialect.ListRevisionStartSQL = q(fmt.Sprintf(listSQL, "?", "-2147483648"))
-	dialect.ListRevisionStartSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "?", "-2147483648"))
-	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, "?", idOfKey))
-	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "?", idOfKey))
+	dialect.GetCurrentSQL = q(fmt.Sprintf(listSQL, "2147483647", "-2147483648", "NULL"))
+	dialect.GetCurrentSQLLimited = q(fmt.Sprintf(listSQL, "2147483647", "-2147483648", "?"))
+	dialect.ListRevisionStartSQL = q(fmt.Sprintf(listSQL, "?", "-2147483648", "NULL"))
+	dialect.ListRevisionStartSQLLimited = q(fmt.Sprintf(listSQL, "?", "-2147483648", "?"))
+	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, "?", idOfKey, "NULL"))
+	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL, "?", idOfKey, "?"))
 	dialect.CountSQL = q(fmt.Sprintf(`
 			SELECT (SELECT MAX(rkv.id) AS id FROM kine AS rkv), COUNT(c.theid)
 			FROM (
