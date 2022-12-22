@@ -68,6 +68,14 @@ var (
 		) AS lkv
 		ORDER BY lkv.theid ASC
 		`, revSQL, compactRevSQL, columns)
+
+	afterSQL = `
+		SELECT (%s), (%s), %s
+		FROM kine AS kv
+		WHERE
+			kv.name LIKE ? AND
+			kv.id > ?
+		ORDER BY kv.id ASC`
 )
 
 type ErrRetry func(error) bool
@@ -83,27 +91,31 @@ type ConnectionPoolConfig struct {
 type Generic struct {
 	sync.Mutex
 
-	LockWrites            bool
-	LastInsertID          bool
-	DB                    *sql.DB
-	GetCurrentSQL         string
-	GetRevisionSQL        string
-	RevisionSQL           string
-	ListRevisionStartSQL  string
-	GetRevisionAfterSQL   string
-	CountSQL              string
-	AfterSQL              string
-	DeleteSQL             string
-	CompactSQL            string
-	UpdateCompactSQL      string
-	PostCompactSQL        string
-	InsertSQL             string
-	FillSQL               string
-	InsertLastInsertIDSQL string
-	GetSizeSQL            string
-	Retry                 ErrRetry
-	TranslateErr          TranslateErr
-	ErrCode               ErrCode
+	LockWrites                  bool
+	LastInsertID                bool
+	DB                          *sql.DB
+	GetCurrentSQL               string
+	GetCurrentSQLLimited        string
+	GetRevisionSQL              string
+	RevisionSQL                 string
+	ListRevisionStartSQL        string
+	ListRevisionStartSQLLimited string
+	GetRevisionAfterSQL         string
+	GetRevisionAfterSQLLimited  string
+	CountSQL                    string
+	AfterSQL                    string
+	AfterSQLLimited             string
+	DeleteSQL                   string
+	CompactSQL                  string
+	UpdateCompactSQL            string
+	PostCompactSQL              string
+	InsertSQL                   string
+	FillSQL                     string
+	InsertLastInsertIDSQL       string
+	GetSizeSQL                  string
+	Retry                       ErrRetry
+	TranslateErr                TranslateErr
+	ErrCode                     ErrCode
 }
 
 func q(sql, param string, numbered bool) string {
@@ -213,9 +225,12 @@ func Open(ctx context.Context, driverName, dataSourceName string, connPoolConfig
 			FROM kine AS kv
 			WHERE kv.id = ?`, columns), paramCharacter, numbered),
 
-		GetCurrentSQL:        q(fmt.Sprintf(listSQL, ""), paramCharacter, numbered),
-		ListRevisionStartSQL: q(fmt.Sprintf(listSQL, "AND mkv.id <= ?"), paramCharacter, numbered),
-		GetRevisionAfterSQL:  q(fmt.Sprintf(listSQL, idOfKey), paramCharacter, numbered),
+		GetCurrentSQL:               q(fmt.Sprintf(listSQL, ""), paramCharacter, numbered),
+		GetCurrentSQLLimited:        q(fmt.Sprintf(listSQL, "")+" LIMIT ?", paramCharacter, numbered),
+		ListRevisionStartSQL:        q(fmt.Sprintf(listSQL, "AND mkv.id <= ?"), paramCharacter, numbered),
+		ListRevisionStartSQLLimited: q(fmt.Sprintf(listSQL, "AND mkv.id <= ?")+" LIMIT ?", paramCharacter, numbered),
+		GetRevisionAfterSQL:         q(fmt.Sprintf(listSQL, idOfKey), paramCharacter, numbered),
+		GetRevisionAfterSQLLimited:  q(fmt.Sprintf(listSQL, idOfKey)+" LIMIT ?", paramCharacter, numbered),
 
 		CountSQL: q(fmt.Sprintf(`
 			SELECT (%s), COUNT(c.theid)
@@ -223,13 +238,8 @@ func Open(ctx context.Context, driverName, dataSourceName string, connPoolConfig
 				%s
 			) c`, revSQL, fmt.Sprintf(listSQL, "")), paramCharacter, numbered),
 
-		AfterSQL: q(fmt.Sprintf(`
-			SELECT (%s), (%s), %s
-			FROM kine AS kv
-			WHERE
-				kv.name LIKE ? AND
-				kv.id > ?
-			ORDER BY kv.id ASC`, revSQL, compactRevSQL, columns), paramCharacter, numbered),
+		AfterSQL:        q(fmt.Sprintf(afterSQL, revSQL, compactRevSQL, columns), paramCharacter, numbered),
+		AfterSQLLimited: q(fmt.Sprintf(afterSQL, revSQL, compactRevSQL, columns)+" LIMIT ?", paramCharacter, numbered),
 
 		DeleteSQL: q(`
 			DELETE FROM kine AS kv
@@ -335,27 +345,24 @@ func (d *Generic) DeleteRevision(ctx context.Context, revision int64) error {
 }
 
 func (d *Generic) ListCurrent(ctx context.Context, prefix string, limit int64, includeDeleted bool) (*sql.Rows, error) {
-	sql := d.GetCurrentSQL
 	if limit > 0 {
-		sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
+		return d.query(ctx, d.GetCurrentSQLLimited, prefix, includeDeleted, limit)
 	}
-	return d.query(ctx, sql, prefix, includeDeleted)
+	return d.query(ctx, d.GetCurrentSQL, prefix, includeDeleted)
 }
 
 func (d *Generic) List(ctx context.Context, prefix, startKey string, limit, revision int64, includeDeleted bool) (*sql.Rows, error) {
 	if startKey == "" {
-		sql := d.ListRevisionStartSQL
 		if limit > 0 {
-			sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
+			return d.query(ctx, d.ListRevisionStartSQLLimited, prefix, revision, includeDeleted, limit)
 		}
-		return d.query(ctx, sql, prefix, revision, includeDeleted)
+		return d.query(ctx, d.ListRevisionStartSQL, prefix, revision, includeDeleted)
 	}
 
-	sql := d.GetRevisionAfterSQL
 	if limit > 0 {
-		sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
+		return d.query(ctx, d.GetRevisionAfterSQLLimited, prefix, revision, startKey, revision, includeDeleted, limit)
 	}
-	return d.query(ctx, sql, prefix, revision, startKey, revision, includeDeleted)
+	return d.query(ctx, d.GetRevisionAfterSQL, prefix, revision, startKey, revision, includeDeleted)
 }
 
 func (d *Generic) Count(ctx context.Context, prefix string) (int64, int64, error) {
@@ -380,11 +387,10 @@ func (d *Generic) CurrentRevision(ctx context.Context) (int64, error) {
 }
 
 func (d *Generic) After(ctx context.Context, prefix string, rev, limit int64) (*sql.Rows, error) {
-	sql := d.AfterSQL
 	if limit > 0 {
-		sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
+		return d.query(ctx, d.AfterSQLLimited, prefix, rev, limit)
 	}
-	return d.query(ctx, sql, prefix, rev)
+	return d.query(ctx, d.AfterSQL, prefix, rev)
 }
 
 func (d *Generic) Fill(ctx context.Context, revision int64) error {
