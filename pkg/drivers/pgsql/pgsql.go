@@ -112,6 +112,7 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 				FROM kine AS mkv
 				WHERE
 					mkv.name LIKE ?
+					AND mkv.id <= %%s
 					%%s
 				GROUP BY mkv.name) AS maxkv
 				ON maxkv.id = kv.id
@@ -124,7 +125,6 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 
 	idOfKey := `
 		AND
-		mkv.id <= ? AND
 		mkv.id > (
 			SELECT MAX(ikv.id) AS id
 			FROM kine AS ikv
@@ -134,17 +134,17 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 
 	// integer ranges from -2147483648 to +2147483647
 
-	dialect.GetCurrentSQL = q(fmt.Sprintf(listSQL, "AND mkv.id <= 2147483647"))
-	dialect.GetCurrentSQLLimited = q(fmt.Sprintf(listSQL+ " LIMIT ?", "AND mkv.id <= 2147483647"))
-	dialect.ListRevisionStartSQL = q(fmt.Sprintf(listSQL, "AND mkv.id <= ?"))
-	dialect.ListRevisionStartSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "AND mkv.id <= ?"))
-	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, idOfKey))
-	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", idOfKey))
+	dialect.GetCurrentSQL = q(fmt.Sprintf(listSQL, "2147483647", ""))
+	dialect.GetCurrentSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "2147483647", ""))
+	dialect.ListRevisionStartSQL = q(fmt.Sprintf(listSQL, "?", ""))
+	dialect.ListRevisionStartSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "?", ""))
+	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, "?", idOfKey))
+	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "?", idOfKey))
 	dialect.CountSQL = q(fmt.Sprintf(`
 			SELECT (%s), COUNT(c.theid)
 			FROM (
 				%s
-			) c`, revSQL, fmt.Sprintf(listSQL, "AND mkv.id <= 2147483647")))
+			) c`, revSQL, fmt.Sprintf(listSQL, "2147483647", "")))
 
 	if err := setup(dialect.DB); err != nil {
 		return nil, err
