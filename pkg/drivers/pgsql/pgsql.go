@@ -43,6 +43,7 @@ var (
 		`CREATE INDEX IF NOT EXISTS kine_id_deleted_index ON kine (id,deleted)`,
 		`CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)`,
+		`CREATE INDEX IF NOT EXISTS kine_list_query_index on kine(name, id DESC) INCLUDE (deleted)`,
 	}
 	createDB = "CREATE DATABASE "
 )
@@ -96,24 +97,17 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 	}
 
 	listSQL := fmt.Sprintf(`
-		SELECT
+		SELECT DISTINCT ON (name)
 			(SELECT MAX(rkv.id) AS id FROM kine AS rkv),
 			(SELECT MAX(crkv.prev_revision) AS prev_revision FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
 			kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
 		FROM kine AS kv
-		JOIN (
-			SELECT MAX(mkv.id) AS id
-			FROM kine AS mkv
-			WHERE
-				mkv.name LIKE ?
-				AND mkv.id <= %%s
-				AND mkv.id > %%s
-			GROUP BY mkv.name) AS maxkv
-			ON maxkv.id = kv.id
 		WHERE
-			kv.deleted = 0 OR
-			?
-		ORDER BY theid ASC
+			kv.name LIKE ?
+			AND kv.id <= %%s
+			AND kv.id > %%s
+			AND (kv.deleted = 0 OR ?)
+		ORDER BY kv.name, theid DESC
 		LIMIT %%s
 		`)
 
@@ -135,19 +129,13 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 	dialect.CountSQL = q(fmt.Sprintf(`
 			SELECT (SELECT MAX(rkv.id) AS id FROM kine AS rkv), COUNT(c.theid)
 			FROM (
-				SELECT
+				SELECT DISTINCT ON (name)
 					kv.id AS theid
 				FROM kine AS kv
-				JOIN (
-					SELECT MAX(mkv.id) AS id
-					FROM kine AS mkv
-					WHERE
-						mkv.name LIKE ?
-					GROUP BY mkv.name) AS maxkv
-					ON maxkv.id = kv.id
 				WHERE
-					kv.deleted = 0 OR
-					?
+					kv.name LIKE ?
+					AND (kv.deleted = 0 OR ?)
+				ORDER BY kv.name, theid DESC
 			) c`))
 
 	if err := setup(dialect.DB); err != nil {
