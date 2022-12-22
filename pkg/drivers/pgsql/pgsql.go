@@ -145,8 +145,6 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 					FROM kine AS mkv
 					WHERE
 						mkv.name LIKE ?
-						AND mkv.id <= 2147483647
-						AND mkv.id > -2147483648
 					GROUP BY mkv.name) AS maxkv
 					ON maxkv.id = kv.id
 				WHERE
