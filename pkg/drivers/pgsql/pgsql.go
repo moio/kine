@@ -44,8 +44,62 @@ var (
 		`CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)`,
 		`CREATE INDEX IF NOT EXISTS kine_list_query_index on kine(name, id DESC) INCLUDE (deleted)`,
+		`CREATE OR REPLACE FUNCTION list_from_kine (
+			p_name_pattern VARCHAR,
+			p_min_id INTEGER,
+			p_min_key VARCHAR,
+			p_max_id INTEGER,
+			p_include_deleted BOOLEAN,
+			p_result_limit INTEGER
+		)
+		RETURNS table (
+			current_id INTEGER,
+			compact_rev_id INTEGER,
+			id INTEGER,
+			name VARCHAR,
+			created INTEGER,
+			deleted INTEGER,
+			create_revision INTEGER,
+			prev_revision INTEGER,
+			lease INTEGER,
+			value BYTEA,
+			old_value BYTEA
+		)
+		AS $$
+			DECLARE
+				min_id INTEGER;
+				current_id INTEGER;
+				compact_rev_id INTEGER;
+			BEGIN
+				IF p_min_key IS NOT NULL THEN
+					SELECT MAX(ikv.id) AS id INTO min_id
+						FROM kine AS ikv
+						WHERE
+							ikv.name = p_min_key AND
+							ikv.id <= p_max_id;
+				ELSE
+					min_id := p_min_id;
+				END IF;
+		
+				SELECT MAX(rkv.id) INTO current_id FROM kine AS rkv;
+				SELECT MAX(crkv.prev_revision) INTO compact_rev_id FROM kine AS crkv WHERE crkv.name = 'compact_rev_key';
+		
+				RETURN QUERY
+					SELECT DISTINCT ON (name)
+						current_id,	compact_rev_id,
+						kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
+					FROM kine AS kv
+					WHERE
+						kv.name LIKE p_name_pattern
+						AND kv.id > min_id
+						AND kv.id <= p_max_id
+						AND (kv.deleted = 0 OR p_include_deleted)
+					ORDER BY kv.name, theid DESC
+					LIMIT p_result_limit;
+			END
+		$$ LANGUAGE plpgsql;`,
 	}
-	createDB = "CREATE DATABASE "
+	createDB = "CREATE DATABASE %s; ALTER DATABASE %s SET DEFAULT_TRANSACTION_ISOLATION TO 'repeatable read';"
 )
 
 func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig, metricsRegisterer prometheus.Registerer) (server.Backend, error) {
@@ -96,36 +150,15 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		return err.Error()
 	}
 
-	listSQL := fmt.Sprintf(`
-		SELECT DISTINCT ON (name)
-			(SELECT MAX(rkv.id) AS id FROM kine AS rkv),
-			(SELECT MAX(crkv.prev_revision) AS prev_revision FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
-			kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
-		FROM kine AS kv
-		WHERE
-			kv.name LIKE ?
-			AND kv.id <= %%s
-			AND kv.id > %%s
-			AND (kv.deleted = 0 OR ?)
-		ORDER BY kv.name, theid DESC
-		LIMIT %%s
-		`)
-
-	idOfKey := `(
-			SELECT MAX(ikv.id) AS id
-			FROM kine AS ikv
-			WHERE
-				ikv.name = ? AND
-				ikv.id <= ?)`
-
 	// integer ranges from -2147483648 to +2147483647
 
-	dialect.GetCurrentSQL = q(fmt.Sprintf(listSQL, "2147483647", "-2147483648", "NULL"))
-	dialect.GetCurrentSQLLimited = q(fmt.Sprintf(listSQL, "2147483647", "-2147483648", "?"))
-	dialect.ListRevisionStartSQL = q(fmt.Sprintf(listSQL, "?", "-2147483648", "NULL"))
-	dialect.ListRevisionStartSQLLimited = q(fmt.Sprintf(listSQL, "?", "-2147483648", "?"))
-	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, "?", idOfKey, "NULL"))
-	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL, "?", idOfKey, "?"))
+	dialect.GetCurrentSQL = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, 2147483647, ?, NULL)")
+	dialect.GetCurrentSQLLimited = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, 2147483647, ?, ?)")
+	dialect.ListRevisionStartSQL = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, ?, ?, NULL)")
+	dialect.ListRevisionStartSQLLimited = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, ?, ?, ?)")
+	dialect.GetRevisionAfterSQL = q("SELECT * FROM list_from_kine(?, ?, ?, ?, ?, NULL)")
+	dialect.GetRevisionAfterSQLLimited = q("SELECT * FROM list_from_kine(?, ?, ?, ?, ?, ?)")
+
 	dialect.CountSQL = q(fmt.Sprintf(`
 			SELECT (SELECT MAX(rkv.id) AS id FROM kine AS rkv), COUNT(c.theid)
 			FROM (
