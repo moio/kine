@@ -95,15 +95,11 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		return err.Error()
 	}
 
-	revSQL := `
-		SELECT MAX(rkv.id) AS id
-		FROM kine AS rkv`
-
 	listSQL := fmt.Sprintf(`
 		SELECT *
 		FROM (
 			SELECT
-				(%s),
+				(SELECT MAX(rkv.id) AS id FROM kine AS rkv),
 				(SELECT MAX(crkv.prev_revision) AS prev_revision FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
 				kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
 			FROM kine AS kv
@@ -121,7 +117,7 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 				?
 		) AS lkv
 		ORDER BY lkv.theid ASC
-		`, revSQL)
+		`)
 
 	idOfKey := `(
 			SELECT MAX(ikv.id) AS id
@@ -139,10 +135,10 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, "?", idOfKey))
 	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL+" LIMIT ?", "?", idOfKey))
 	dialect.CountSQL = q(fmt.Sprintf(`
-			SELECT (%s), COUNT(c.theid)
+			SELECT (SELECT MAX(rkv.id) AS id FROM kine AS rkv), COUNT(c.theid)
 			FROM (
 				%s
-			) c`, revSQL, fmt.Sprintf(listSQL, "2147483647", "-2147483648")))
+			) c`, fmt.Sprintf(listSQL, "2147483647", "-2147483648")))
 
 	if err := setup(dialect.DB); err != nil {
 		return nil, err
