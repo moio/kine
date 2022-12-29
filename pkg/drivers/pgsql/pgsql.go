@@ -67,20 +67,9 @@ var (
 		)
 		AS $$
 			DECLARE
-				min_id INTEGER;
 				current_id INTEGER;
 				compact_rev_id INTEGER;
 			BEGIN
-				IF p_min_key IS NOT NULL THEN
-					SELECT MAX(ikv.id) AS id INTO min_id
-						FROM kine AS ikv
-						WHERE
-							ikv.name = p_min_key AND
-							ikv.id <= p_max_id;
-				ELSE
-					min_id := p_min_id;
-				END IF;
-		
 				SELECT MAX(rkv.id) INTO current_id FROM kine AS rkv;
 				SELECT MAX(crkv.prev_revision) INTO compact_rev_id FROM kine AS crkv WHERE crkv.name = 'compact_rev_key';
 		
@@ -91,7 +80,7 @@ var (
 					FROM kine AS kv
 					WHERE
 						kv.name LIKE p_name_pattern
-						AND kv.id > min_id
+						AND (p_min_key IS NULL OR kv.name > p_min_key)
 						AND kv.id <= p_max_id
 						AND (kv.deleted = 0 OR p_include_deleted)
 					ORDER BY kv.name, theid DESC
