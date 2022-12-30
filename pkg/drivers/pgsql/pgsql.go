@@ -44,49 +44,6 @@ var (
 		`CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)`,
 		`CREATE INDEX IF NOT EXISTS kine_list_query_index on kine(name, id DESC) INCLUDE (deleted)`,
-		`CREATE OR REPLACE FUNCTION list_from_kine (
-			p_name_pattern VARCHAR,
-			p_min_id INTEGER,
-			p_min_key VARCHAR,
-			p_max_id INTEGER,
-			p_include_deleted BOOLEAN,
-			p_result_limit INTEGER
-		)
-		RETURNS table (
-			current_id INTEGER,
-			compact_rev_id INTEGER,
-			id INTEGER,
-			name VARCHAR,
-			created INTEGER,
-			deleted INTEGER,
-			create_revision INTEGER,
-			prev_revision INTEGER,
-			lease INTEGER,
-			value BYTEA,
-			old_value BYTEA
-		)
-		AS $$
-			DECLARE
-				current_id INTEGER;
-				compact_rev_id INTEGER;
-			BEGIN
-				SELECT MAX(rkv.id) INTO current_id FROM kine AS rkv;
-				SELECT MAX(crkv.prev_revision) INTO compact_rev_id FROM kine AS crkv WHERE crkv.name = 'compact_rev_key';
-		
-				RETURN QUERY
-					SELECT DISTINCT ON (name)
-						current_id,	compact_rev_id,
-						kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
-					FROM kine AS kv
-					WHERE
-						kv.name LIKE p_name_pattern
-						AND (p_min_key IS NULL OR kv.name > p_min_key)
-						AND kv.id <= p_max_id
-						AND (kv.deleted = 0 OR p_include_deleted)
-					ORDER BY kv.name, theid DESC
-					LIMIT p_result_limit;
-			END
-		$$ LANGUAGE plpgsql;`,
 	}
 	createDB = "CREATE DATABASE %s;"
 )
@@ -139,14 +96,29 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		return err.Error()
 	}
 
+	listSQL := `
+		SELECT DISTINCT ON (name)
+			(SELECT MAX(rkv.id) FROM kine AS rkv),
+			(SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = 'compact_rev_key'),
+			kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value
+		FROM kine AS kv
+		WHERE
+			kv.name LIKE %s
+			AND %s
+			AND %s
+			AND (kv.deleted = 0 OR %s)
+		ORDER BY kv.name, theid DESC
+		LIMIT %s;
+	`
+
 	// integer ranges from -2147483648 to +2147483647
 
-	dialect.GetCurrentSQL = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, 2147483647, ?, NULL)")
-	dialect.GetCurrentSQLLimited = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, 2147483647, ?, ?)")
-	dialect.ListRevisionStartSQL = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, ?, ?, NULL)")
-	dialect.ListRevisionStartSQLLimited = q("SELECT * FROM list_from_kine(?, -2147483648, NULL, ?, ?, ?)")
-	dialect.GetRevisionAfterSQL = q("SELECT * FROM list_from_kine(?, ?, ?, ?, ?, NULL)")
-	dialect.GetRevisionAfterSQLLimited = q("SELECT * FROM list_from_kine(?, ?, ?, ?, ?, ?)")
+	dialect.GetCurrentSQL = q(fmt.Sprintf(listSQL, "?", "TRUE", "TRUE", "?", "NULL"))
+	dialect.GetCurrentSQLLimited = q(fmt.Sprintf(listSQL, "?", "TRUE", "TRUE", "?", "?"))
+	dialect.ListRevisionStartSQL = q(fmt.Sprintf(listSQL, "?", "TRUE", "kv.id <= ?", "?", "NULL"))
+	dialect.ListRevisionStartSQLLimited = q(fmt.Sprintf(listSQL, "?", "TRUE", "kv.id <= ?", "?", "?"))
+	dialect.GetRevisionAfterSQL = q(fmt.Sprintf(listSQL, "?", "? > 0 AND kv.name > ?", "kv.id <= ?", "?", "NULL"))
+	dialect.GetRevisionAfterSQLLimited = q(fmt.Sprintf(listSQL, "?", "? > 0 AND kv.name > ?", "kv.id <= ?", "?", "?"))
 
 	dialect.CountSQL = q(fmt.Sprintf(`
 			SELECT (SELECT MAX(rkv.id) AS id FROM kine AS rkv), COUNT(c.theid)
