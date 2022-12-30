@@ -88,7 +88,7 @@ var (
 			END
 		$$ LANGUAGE plpgsql;`,
 	}
-	createDB = "CREATE DATABASE %s; ALTER DATABASE %s SET DEFAULT_TRANSACTION_ISOLATION TO 'repeatable read';"
+	createDB = "CREATE DATABASE %s;"
 )
 
 func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig, metricsRegisterer prometheus.Registerer) (server.Backend, error) {
