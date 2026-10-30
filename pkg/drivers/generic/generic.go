@@ -6,8 +6,11 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Rican7/retry/backoff"
@@ -52,10 +55,12 @@ var (
 	getValSQL  = fmt.Sprintf(ListFmt, WithVal, CurrentRevSQL, CompactRevSQL, EqualsNameSQL)
 )
 
-type ErrRetry func(error) bool
-type TranslateErr func(error) error
-type ErrCode func(error) string
-type SubstituteFunc func(string) string
+type (
+	ErrRetry       func(error) bool
+	TranslateErr   func(error) error
+	ErrCode        func(error) string
+	SubstituteFunc func(string) string
+)
 
 type ConnectionPoolConfig struct {
 	MaxIdle     int           // zero means defaultMaxIdleConns; negative means 0
@@ -103,6 +108,32 @@ type Generic struct {
 	TranslateStartKeyFunc   SubstituteFunc
 	ErrCode                 ErrCode
 	FillRetryDuration       time.Duration
+
+	// --- cached revision substitution (OPTIMIZATION_ROUND_1.md T3) ---
+	// Every read query embeds two scalar subqueries: the current revision
+	// (MAX(id), an index-only backward scan) and the compaction revision
+	// (MAX(prev_revision) WHERE name='compact_rev_key', a second index-only
+	// scan). Both are recomputed server-side for every single query. When
+	// enabled via KINE_T3_COMPACT_REV_REFRESH / KINE_T3_CURRENT_REV_REFRESH,
+	// these subquery texts are replaced with cached literals before execution,
+	// removing two index scans plus plan complexity from every query.
+	//
+	// Staleness: the compact revision moves only on compaction (bounded by
+	// the refresh interval, also refreshed eagerly after UpdateCompact).
+	// Binding the CURRENT revision (KINE_T3_CURRENT_REV_REFRESH) bounds
+	// response-header freshness by the refresh interval; today each query's
+	// MAX(id) subquery makes header and data a single consistent snapshot.
+	// Single-writer instances are exact (refreshed eagerly on Insert). For
+	// multi-writer deployments the current-rev cache is NOT safe by default —
+	// it is off unless explicitly enabled. Only use it where the added
+	// latency is acceptable.
+	compactRevCache  atomic.Pointer[string] // nil = not loaded; else literal SQL text ("NULL" or int)
+	currentRevCache  atomic.Pointer[string]
+	revCacheOnce     sync.Once
+	revCacheDBLoaded atomic.Bool
+	// currentRevRefreshOn mirrors KINE_T3_CURRENT_REV_REFRESH>0; read in the
+	// Insert hot path of execute() (see startRevCacheRefresher)
+	currentRevRefreshOn atomic.Bool
 }
 
 func (d *Generic) Migrate(ctx context.Context) {
@@ -305,28 +336,33 @@ func OpenDB(ctx context.Context, wg *sync.WaitGroup, driverName string, connecto
 }
 
 func (d *Generic) query(ctx context.Context, sql *query.Named, args ...any) (result *sql.Rows, err error) {
+	d.startRevCacheRefresher()
+	q := d.substituteCachedRevs(sql.Name, sql.Query)
 	query := sql.Fill(args)
 	logrus.Tracef("QUERY: %s", query)
 	startTime := time.Now()
 	defer func() {
 		metrics.ObserveSQL(startTime, d.ErrCode(err), 0, query)
 	}()
-	return d.DB.QueryContext(ctx, sql.Query, args...)
+	return d.DB.QueryContext(ctx, q, args...)
 }
 
 func (d *Generic) queryRow(ctx context.Context, sql *query.Named, args ...any) (result *sql.Row) {
+	d.startRevCacheRefresher()
+	q := d.substituteCachedRevs(sql.Name, sql.Query)
 	query := sql.Fill(args)
 	logrus.Tracef("QUERY ROW: %s", query)
 	startTime := time.Now()
 	defer func() {
 		metrics.ObserveSQL(startTime, d.ErrCode(result.Err()), 0, query)
 	}()
-	return d.DB.QueryRowContext(ctx, sql.Query, args...)
+	return d.DB.QueryRowContext(ctx, q, args...)
 }
 
 func (d *Generic) execute(ctx context.Context, sql *query.Named, args ...any) (result sql.Result, err error) {
 	retries := 0
 	startTime := time.Now()
+	queryText := d.substituteCachedRevs(sql.Name, sql.Query)
 	query := sql.Fill(args)
 	if d.LockWrites {
 		d.Lock()
@@ -340,14 +376,160 @@ func (d *Generic) execute(ctx context.Context, sql *query.Named, args ...any) (r
 	wait := strategy.Backoff(backoff.Linear(100 * time.Millisecond))
 	for ; retries < 20; retries++ {
 		logrus.Tracef("EXEC (try=%d): %s", retries, query)
-		result, err = d.DB.ExecContext(ctx, sql.Query, args...)
+		result, err = d.DB.ExecContext(ctx, queryText, args...)
 		if err != nil && d.Retry != nil && d.Retry(err) {
 			wait(uint(retries))
 			continue
 		}
+		if err == nil && sql.Name == "UpdateCompact" {
+			// the compaction revision just changed; refresh the cache eagerly
+			// instead of waiting out the refresh interval
+			go d.refreshCompactRev()
+		}
+		if err == nil && d.currentRevRefreshOn.Load() &&
+			(sql.Name == "Insert" || sql.Name == "InsertLastInsertID") {
+			// keep the cached current revision exact for single-writer
+			// instances: the next request's header/compare must see this row
+			d.refreshCurrentRev()
+		}
 		return result, err
 	}
 	return result, err
+}
+
+// --- cached revision substitution (OPTIMIZATION_ROUND_1.md T3) ---
+
+// The exact subquery texts as they appear in executed queries — WITHOUT the
+// wrapping parentheses, which the templates own. Replacing the inner text
+// keeps the query shape identical: (...subquery...) -> (literal). The
+// templates interpolate CurrentRevSQL/CompactRevSQL verbatim and query.New
+// normalizes whitespace runs to single spaces, so these strings are stable.
+const (
+	currentRevSubSQL = "SELECT MAX(id) AS current_rev FROM kine"
+	compactRevSubSQL = "SELECT MAX(prev_revision) AS compact_rev FROM kine WHERE name = 'compact_rev_key'"
+)
+
+// envRefreshInterval reads an interval from env; 0 (or invalid) disables.
+func envRefreshInterval(env string) time.Duration {
+	v := os.Getenv(env)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		logrus.Warnf("invalid %s=%q, cached revision substitution disabled", env, v)
+		return 0
+	}
+	return d
+}
+
+// substituteCachedRevs replaces the current/compact revision subqueries with
+// cached constant subqueries. Values not yet loaded (or feature disabled)
+// leave the query untouched. The inner text is replaced with "SELECT <lit>
+// AS ...", which is valid in every position the subquery appears: a FROM
+// item (requires a subselect — a bare literal is a syntax error) and a
+// scalar select-list item. The constant subquery is inlined by the planner.
+//
+// Substitution is restricted to the rev==0 "current state" read queries.
+// Revision-bounded queries (GetRevisionAfter*, After*, Count*) MUST keep the
+// live subquery: their ErrFutureRev/ErrCompacted checks compare a client- or
+// internally-supplied revision against batch.CurrentRev, and a cached value
+// lagging concurrent writes turns every update-of-existing-key into a
+// spurious "required revision is a future revision" (measured 2026-10-29:
+// put/c8 99.6k/100k requests errored before this restriction).
+var revCacheSubstitutable = map[string]bool{
+	"GetSingle":      true,
+	"GetSingleVal":   true,
+	"ListCurrent":    true,
+	"ListCurrentVal": true,
+	"AllCurrent":     true,
+	"AllCurrentVal":  true,
+}
+
+func (d *Generic) substituteCachedRevs(name, q string) string {
+	if !revCacheSubstitutable[name] {
+		return q
+	}
+	if v := d.compactRevCache.Load(); v != nil {
+		q = strings.ReplaceAll(q, compactRevSubSQL, "SELECT "+*v+" AS compact_rev")
+	}
+	if v := d.currentRevCache.Load(); v != nil {
+		q = strings.ReplaceAll(q, currentRevSubSQL, "SELECT "+*v+" AS current_rev")
+	}
+	return q
+}
+
+// startRevCacheRefresher lazily starts the background refreshers, enabled via
+// env: KINE_T3_COMPACT_REV_REFRESH (e.g. 30s) and KINE_T3_CURRENT_REV_REFRESH
+// (e.g. 250ms). Both off by default — upstream behavior unchanged. The
+// intervals must be captured at start time for the Insert-hook in execute();
+// envRefreshInterval is called here and the enablement stored atomically.
+func (d *Generic) startRevCacheRefresher() {
+	d.revCacheOnce.Do(func() {
+		compactInterval := envRefreshInterval("KINE_T3_COMPACT_REV_REFRESH")
+		currentInterval := envRefreshInterval("KINE_T3_CURRENT_REV_REFRESH")
+		if compactInterval == 0 && currentInterval == 0 {
+			return
+		}
+		if currentInterval > 0 {
+			d.currentRevRefreshOn.Store(true)
+		}
+		if compactInterval > 0 {
+			if err := d.refreshCompactRev(); err == nil {
+				go func() {
+					for {
+						time.Sleep(compactInterval)
+						d.refreshCompactRev()
+					}
+				}()
+			}
+		}
+		if currentInterval > 0 {
+			if err := d.refreshCurrentRev(); err == nil {
+				go func() {
+					for {
+						time.Sleep(currentInterval)
+						d.refreshCurrentRev()
+					}
+				}()
+			}
+		}
+		logrus.Infof("cached revision substitution enabled: compactRev refresh=%s, currentRev refresh=%s", compactInterval, currentInterval)
+	})
+}
+
+// refreshCompactRev loads MAX(prev_revision) for the compact marker. NULL
+// (no compaction yet, or the marker row not created yet during schema init)
+// is cached as 0 — kine's "nothing compacted" semantic. Caching NULL here
+// poisons put-path scans (compact_rev scanned into int64) until the marker
+// row appears and the next refresh lands.
+func (d *Generic) refreshCompactRev() error {
+	var rev sql.NullInt64
+	row := d.DB.QueryRowContext(context.Background(), CompactRevSQL)
+	if err := row.Scan(&rev); err != nil {
+		return err
+	}
+	lit := "0"
+	if rev.Valid {
+		lit = strconv.FormatInt(rev.Int64, 10)
+	}
+	d.compactRevCache.Store(&lit)
+	return nil
+}
+
+// refreshCurrentRev loads MAX(id). An empty table caches 0.
+func (d *Generic) refreshCurrentRev() error {
+	var id sql.NullInt64
+	row := d.DB.QueryRowContext(context.Background(), CurrentRevSQL)
+	if err := row.Scan(&id); err != nil {
+		return err
+	}
+	lit := "0"
+	if id.Valid {
+		lit = strconv.FormatInt(id.Int64, 10)
+	}
+	d.currentRevCache.Store(&lit)
+	return nil
 }
 
 func (d *Generic) GetCompactRevision(ctx context.Context) (int64, error) {
