@@ -3,6 +3,7 @@ package sqllog
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -356,7 +357,7 @@ func (s *SQLLog) After(ctx context.Context, key, end string, revision, limit int
 
 func (s *SQLLog) List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (server.EventBatch, error) {
 	var (
-		rows    *sql.Rows
+		rows    server.RowSet
 		batch   server.EventBatch
 		compact int64
 	)
@@ -408,7 +409,7 @@ func (s *SQLLog) List(ctx context.Context, key, end string, limit, revision int6
 
 func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) server.ListResult {
 	var (
-		rows *sql.Rows
+		rows server.RowSet
 		kvc  = make(chan *server.KeyValue, 1)
 		errc = make(chan error, 1)
 	)
@@ -539,6 +540,8 @@ type scanDests struct {
 	cur     sql.NullInt64
 	compact sql.NullInt64
 	prevMod int64
+	create  int64
+	delete  int64
 	value   sql.RawBytes
 	prevVal sql.RawBytes
 }
@@ -546,7 +549,7 @@ type scanDests struct {
 // rowsToEvents converts database rows to KV store events.
 // if val is false, rows must not include the current value
 // if prev is false, rows must additionally not include the previous value
-func RowsToEvents(rows *sql.Rows, val, prev bool) (server.EventBatch, int64, error) {
+func RowsToEvents(rows server.RowSet, val, prev bool) (server.EventBatch, int64, error) {
 	var (
 		batch   server.EventBatch
 		compact int64
@@ -554,8 +557,21 @@ func RowsToEvents(rows *sql.Rows, val, prev bool) (server.EventBatch, int64, err
 	)
 	defer rows.Close()
 
+	// pgx-native rows expose the raw wire-format values; when they do and
+	// every field is binary-encoded, scan each row directly from the wire
+	// bytes instead of routing through Scan's interface boxing.
+	fast := rows.Binary() && rows.RawValues() != nil
+
 	for rows.Next() {
-		event, err := scan(rows, &batch.CurrentRev, &compact, val, prev, &arena)
+		var (
+			event *server.Event
+			err   error
+		)
+		if fast {
+			event, err = scanFast(rows.RawValues(), &batch.CurrentRev, &compact, val, prev, &arena)
+		} else {
+			event, err = scan(rows, &batch.CurrentRev, &compact, val, prev, &arena)
+		}
 		if err != nil {
 			return batch, 0, err
 		}
@@ -784,9 +800,87 @@ func (s *SQLLog) Append(ctx context.Context, event *server.Event) (int64, error)
 	return rev, nil
 }
 
+// wire-format column decoders. PostgreSQL binary encoding: int8 and
+// int4 are big-endian two's complement, bytea carries a 4-byte length
+// prefix, and text is the raw UTF-8 bytes.
+
+func decInt8(b []byte) int64 {
+	if len(b) != 8 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(b))
+}
+
+func decInt4(b []byte) int64 {
+	if len(b) != 4 {
+		return 0
+	}
+	return int64(int32(binary.BigEndian.Uint32(b)))
+}
+
+func decBytea(b []byte) []byte {
+	if len(b) < 4 {
+		return nil
+	}
+	plen := int(binary.BigEndian.Uint32(b[:4]))
+	if plen != len(b)-4 {
+		// shouldn't happen for well-formed wire data; fail safe
+		return nil
+	}
+	return b[4:]
+}
+
+// scanFast builds a server.Event directly from a row's raw wire-format
+// values (PostgreSQL binary format, as exposed by pgx Rows.RawValues).
+// Column layout: current_rev, compact_rev, id, name, created, deleted,
+// create_revision, prev_revision, lease [, value [, old_value]].
+// The raw values alias the connection buffer and must be copied before
+// the next rows.Next() call, which the arena does immediately.
+func scanFast(raws [][]byte, rev *int64, compact *int64, val, prev bool, arena *byteArena) (*server.Event, error) {
+	if len(raws) < 9 {
+		return nil, fmt.Errorf("expected at least 9 columns, got %d", len(raws))
+	}
+	event := &server.Event{
+		KV: &server.KeyValue{},
+	}
+	if prev {
+		event.PrevKV = &server.KeyValue{}
+	}
+
+	event.KV.ModRevision = decInt8(raws[2])
+	event.KV.Key = string(raws[3])
+	event.Create = decInt4(raws[4]) != 0
+	event.Delete = decInt4(raws[5]) != 0
+	event.KV.CreateRevision = decInt8(raws[6])
+	prevMod := decInt8(raws[7])
+	event.KV.Lease = decInt4(raws[8])
+	if prev {
+		event.PrevKV.ModRevision = prevMod
+	}
+	if val && len(raws) > 9 {
+		event.KV.Value = arena.clone(decBytea(raws[9]))
+	}
+	if prev && len(raws) > 10 {
+		event.PrevKV.Value = arena.clone(decBytea(raws[10]))
+	}
+
+	if event.Create {
+		event.KV.CreateRevision = event.KV.ModRevision
+		event.PrevKV = nil
+	} else if prev {
+		event.PrevKV.CreateRevision = event.KV.CreateRevision
+		event.PrevKV.Lease = event.KV.Lease
+		event.PrevKV.Key = event.KV.Key
+	}
+
+	*rev = decInt8(raws[0])
+	*compact = decInt8(raws[1])
+	return event, nil
+}
+
 // scan scans the current row's columns into a server.Event struct.
 // If a valid event is scanned, the passed rev and compact vars are also updated.
-func scan(rows *sql.Rows, rev *int64, compact *int64, val, prev bool, arena *byteArena) (*server.Event, error) {
+func scan(rows server.RowSet, rev *int64, compact *int64, val, prev bool, arena *byteArena) (*server.Event, error) {
 	event := &server.Event{
 		KV: &server.KeyValue{},
 	}
@@ -807,8 +901,11 @@ func scan(rows *sql.Rows, rev *int64, compact *int64, val, prev bool, arena *byt
 	dests[1] = &dest.compact
 	dests[2] = &event.KV.ModRevision
 	dests[3] = &event.KV.Key
-	dests[4] = &event.Create
-	dests[5] = &event.Delete
+	// created/deleted are int4 columns; scan into int64 scratch and
+	// convert (database/sql would convert to *bool implicitly, pgx will
+	// not)
+	dests[4] = &dest.create
+	dests[5] = &dest.delete
 	dests[6] = &event.KV.CreateRevision
 	if prev {
 		dests[7] = &event.PrevKV.ModRevision
@@ -830,6 +927,8 @@ func scan(rows *sql.Rows, rev *int64, compact *int64, val, prev bool, arena *byt
 	if err != nil {
 		return nil, err
 	}
+	event.Create = dest.create != 0
+	event.Delete = dest.delete != 0
 
 	if val {
 		event.KV.Value = arena.clone(dest.value)

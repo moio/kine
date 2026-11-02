@@ -12,6 +12,8 @@ import (
 
 	"github.com/Rican7/retry/backoff"
 	"github.com/Rican7/retry/strategy"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/k3s-io/kine/pkg/metrics"
 	"github.com/k3s-io/kine/pkg/query"
 	"github.com/k3s-io/kine/pkg/server"
@@ -70,6 +72,10 @@ type Generic struct {
 	LockWrites              bool
 	LastInsertID            bool
 	DB                      *sql.DB
+	// PgxPool, when set, routes read queries (List/ListCurrent/After)
+	// through a pgx-native connection pool instead of database/sql,
+	// enabling raw wire-format scanning. Write queries always use DB.
+	PgxPool                 *pgxpool.Pool
 	GetSingleSQL            *query.Named
 	GetSingleValSQL         *query.Named
 	AllCurrentSQL           *query.Named
@@ -304,14 +310,65 @@ func OpenDB(ctx context.Context, wg *sync.WaitGroup, driverName string, connecto
 	}, err
 }
 
-func (d *Generic) query(ctx context.Context, sql *query.Named, args ...any) (result *sql.Rows, err error) {
+// sqlRowSet adapts *sql.Rows to server.RowSet. database/sql cannot
+// expose raw wire-format values, so RawValues returns nil and Binary
+// reports false, forcing the slow scan path.
+type sqlRowSet struct {
+	rows *sql.Rows
+}
+
+func (r *sqlRowSet) Next() bool                { return r.rows.Next() }
+func (r *sqlRowSet) Scan(dest ...any) error    { return r.rows.Scan(dest...) }
+func (r *sqlRowSet) Close()                    { r.rows.Close() }
+func (r *sqlRowSet) Err() error                { return r.rows.Err() }
+func (r *sqlRowSet) RawValues() [][]byte       { return nil }
+func (r *sqlRowSet) Binary() bool              { return false }
+
+// pgxRowSet adapts pgx.Rows to server.RowSet, exposing raw wire-format
+// values. The values alias pgx's connection read buffer and are only
+// valid until the next call to Next; consumers must copy immediately.
+type pgxRowSet struct {
+	rows pgx.Rows
+	bin  bool
+}
+
+func newPgxRowSet(rows pgx.Rows) *pgxRowSet {
+	r := &pgxRowSet{rows: rows, bin: true}
+	for _, f := range rows.FieldDescriptions() {
+		if f.Format != pgx.BinaryFormatCode {
+			r.bin = false
+			break
+		}
+	}
+	return r
+}
+
+func (r *pgxRowSet) Next() bool          { return r.rows.Next() }
+func (r *pgxRowSet) Scan(dest ...any) error { return r.rows.Scan(dest...) }
+func (r *pgxRowSet) Close()              { r.rows.Close() }
+func (r *pgxRowSet) Err() error          { return r.rows.Err() }
+func (r *pgxRowSet) RawValues() [][]byte { return r.rows.RawValues() }
+func (r *pgxRowSet) Binary() bool        { return r.bin }
+
+func (d *Generic) query(ctx context.Context, sql *query.Named, args ...any) (result server.RowSet, err error) {
 	query := sql.Fill(args)
 	logrus.Tracef("QUERY: %s", query)
 	startTime := time.Now()
 	defer func() {
 		metrics.ObserveSQL(startTime, d.ErrCode(err), 0, query)
 	}()
-	return d.DB.QueryContext(ctx, sql.Query, args...)
+	if d.PgxPool != nil {
+		rows, err := d.PgxPool.Query(ctx, sql.Query, args...)
+		if err != nil {
+			return nil, err
+		}
+		return newPgxRowSet(rows), nil
+	}
+	rows, err := d.DB.QueryContext(ctx, sql.Query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &sqlRowSet{rows: rows}, nil
 }
 
 func (d *Generic) queryRow(ctx context.Context, sql *query.Named, args ...any) (result *sql.Row) {
@@ -390,7 +447,7 @@ func (d *Generic) DeleteRevision(ctx context.Context, revision int64) error {
 	return err
 }
 
-func (d *Generic) ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (*sql.Rows, error) {
+func (d *Generic) ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (server.RowSet, error) {
 	var sql *query.Named
 	if key == "" {
 		if keysOnly {
@@ -416,7 +473,7 @@ func (d *Generic) ListCurrent(ctx context.Context, key, end string, limit int64,
 	return d.query(ctx, sql, key, end, includeDeleted)
 }
 
-func (d *Generic) List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (*sql.Rows, error) {
+func (d *Generic) List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (server.RowSet, error) {
 	var sql *query.Named
 	if end == "" {
 		if keysOnly {
@@ -480,7 +537,7 @@ func (d *Generic) CurrentRevision(ctx context.Context) (int64, error) {
 	return id, err
 }
 
-func (d *Generic) After(ctx context.Context, key, end string, rev, limit int64) (*sql.Rows, error) {
+func (d *Generic) After(ctx context.Context, key, end string, rev, limit int64) (server.RowSet, error) {
 	var sql *query.Named
 	if key == "" {
 		sql = d.AfterAllOldValSQL

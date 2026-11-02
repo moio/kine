@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/k3s-io/kine/pkg/dialer"
 	"github.com/k3s-io/kine/pkg/drivers"
@@ -103,6 +104,21 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		return false, nil, err
 	}
 
+	if nativeReads() {
+		pool, err := openPgxPool(ctx, config, cfg.ConnectionPoolConfig)
+		if err != nil {
+			return false, nil, err
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ctx.Done()
+			pool.Close()
+		}()
+		dialect.PgxPool = pool
+		logrus.Info("pgx-native read path enabled (KINE_PGSQL_NATIVE_READS)")
+	}
+
 	dialect.GetSizeSQL = query.New(`SELECT pg_total_relation_size('kine')`, "$", true, "GetSize")
 	dialect.CompactSQL = query.New(`
 		DELETE FROM kine AS kv
@@ -163,6 +179,57 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 
 	dialect.Migrate(context.Background())
 	return true, logstructured.New(sqllog.New(dialect, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+}
+
+// nativeReads reports whether the pgx-native read path is enabled.
+func nativeReads() bool {
+	v := os.Getenv("KINE_PGSQL_NATIVE_READS")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// openPgxPool creates the pgx-native connection pool used for read
+// queries. Pool sizing: MaxConns mirrors the stdlib pool's MaxOpen (or
+// MaxIdle when unlimited); MinConns is half of MaxIdle, keeping warm
+// connections on hand for read bursts while staying under the server's
+// max_connections when both pools are populated (writes always use the
+// stdlib pool, which keeps up to MaxIdle connections).
+func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig generic.ConnectionPoolConfig) (*pgxpool.Pool, error) {
+	maxIdle := connPoolConfig.MaxIdle
+	if maxIdle == 0 {
+		maxIdle = 20
+	} else if maxIdle < 0 {
+		maxIdle = 0
+	}
+
+	poolCfg, err := pgxpool.ParseConfig(config.ConnString())
+	if err != nil {
+		return nil, err
+	}
+	// ConnString round-trips TLS but not the custom dialer
+	poolCfg.ConnConfig.DialFunc = config.DialFunc
+	poolCfg.MaxConns = int32(maxIdle)
+	poolCfg.MinConns = int32(maxIdle / 2)
+	poolCfg.MaxConnLifetime = connPoolConfig.MaxLifetime
+	poolCfg.MaxConnIdleTime = connPoolConfig.MaxIdleTime
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// warm the pool up front so the first read bursts don't pay for
+	// connection establishment (min connections are otherwise established
+	// lazily)
+	for i := 0; i < int(poolCfg.MinConns); i++ {
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+		conn.Release()
+	}
+
+	return pool, nil
 }
 
 func setup(db *sql.DB) error {

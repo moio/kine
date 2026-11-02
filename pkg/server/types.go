@@ -42,12 +42,12 @@ type Backend interface {
 }
 
 type Dialect interface {
-	ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (*sql.Rows, error)
-	List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (*sql.Rows, error)
+	ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (RowSet, error)
+	List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (RowSet, error)
 	CountCurrent(ctx context.Context, key, end string) (int64, int64, error)
 	Count(ctx context.Context, key, end string, revision int64) (int64, int64, int64, error)
 	CurrentRevision(ctx context.Context) (int64, error)
-	After(ctx context.Context, key, end string, rev, limit int64) (*sql.Rows, error)
+	After(ctx context.Context, key, end string, rev, limit int64) (RowSet, error)
 	//nolint:revive
 	Insert(ctx context.Context, key string, create, delete bool, createRevision, previousRevision int64, ttl int64, value []byte) (int64, error)
 	DeleteRevision(ctx context.Context, revision int64) error
@@ -75,6 +75,26 @@ type Transaction interface {
 	CurrentRevision(ctx context.Context) (int64, error)
 }
 
+// RowSet is the minimal row-consumption interface returned by the
+// Dialect read methods. It is satisfied by both *sql.Rows (through an
+// adapter) and by pgx-native rows, which additionally expose raw
+// wire-format values for zero-copy scanning.
+type RowSet interface {
+	Next() bool
+	Scan(dest ...any) error
+	Close()
+	Err() error
+	// RawValues returns the raw wire-format column values of the current
+	// row. The returned slices alias the driver's internal buffers and are
+	// only valid until the next call to Next. Implementations that cannot
+	// expose raw values return nil.
+	RawValues() [][]byte
+	// Binary reports whether every result field uses the binary wire
+	// format (a precondition for interpreting RawValues).
+	Binary() bool
+}
+
+// KeyValue is the primary KV representation.
 type KeyValue struct {
 	Key            string
 	Value          []byte
