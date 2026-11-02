@@ -431,6 +431,9 @@ func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revisio
 		return errorResult(err)
 	}
 
+	// one arena for the whole streamed result set
+	arena := &byteArena{}
+
 	if revision == 0 {
 		rows, err = s.d.ListCurrent(ctx, key, end, limit, includeDeleted, keysOnly)
 	} else {
@@ -443,7 +446,7 @@ func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revisio
 	// scan first row now, to get current and compact revs
 	var current, compact int64
 	if rows.Next() {
-		event, err := scan(rows, &current, &compact, !keysOnly, false)
+		event, err := scan(rows, &current, &compact, !keysOnly, false, arena)
 		if err != nil {
 			return errorResult(err)
 		}
@@ -473,7 +476,7 @@ func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revisio
 		defer close(kvc)
 		defer close(errc)
 		for rows.Next() {
-			event, err := scan(rows, &current, &compact, !keysOnly, false)
+			event, err := scan(rows, &current, &compact, !keysOnly, false, arena)
 			if err != nil {
 				errc <- err
 				return
@@ -491,6 +494,55 @@ func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revisio
 	return server.ListResult{KVc: kvc, Errorc: errc, CurrentRevision: current}
 }
 
+// byteArena batches the byte copies of one result set's scanned values into
+// a small number of backing chunks. Scanning through database/sql hands us a
+// freshly allocated copy of every bytea column; routing those bytes through
+// the arena replaces one allocation per value with one per chunk, and puts
+// the values of a result set in contiguous memory, which keeps the later
+// protobuf marshal pass cache-friendly.
+type byteArena struct {
+	cur []byte // current chunk; len(cur) is the used prefix
+}
+
+const arenaChunkSize = 64 << 10
+
+// clone returns a copy of b owned by the arena. The returned slice must be
+// treated as read-only (it shares backing with other values in the chunk).
+func (a *byteArena) clone(b []byte) []byte {
+	if len(b) == 0 {
+		if b == nil {
+			return nil
+		}
+		return []byte{}
+	}
+	if cap(a.cur)-len(a.cur) < len(b) {
+		size := arenaChunkSize
+		if a.cur == nil {
+			// the first chunk is sized to the first value so that small
+			// results (point reads) only pay for what they need
+			size = len(b)
+		} else if len(b) > size {
+			size = len(b)
+		}
+		a.cur = make([]byte, 0, size)
+	}
+	start := len(a.cur)
+	a.cur = a.cur[:start+len(b)]
+	copy(a.cur[start:], b)
+	return a.cur[start : start+len(b) : start+len(b)]
+}
+
+// scanDests is per-row scratch destination storage. The RawBytes fields alias
+// driver-owned buffers that are only valid until the next call to
+// rows.Next(), so their contents must be consumed (copied) immediately.
+type scanDests struct {
+	cur     sql.NullInt64
+	compact sql.NullInt64
+	prevMod int64
+	value   sql.RawBytes
+	prevVal sql.RawBytes
+}
+
 // rowsToEvents converts database rows to KV store events.
 // if val is false, rows must not include the current value
 // if prev is false, rows must additionally not include the previous value
@@ -498,11 +550,12 @@ func RowsToEvents(rows *sql.Rows, val, prev bool) (server.EventBatch, int64, err
 	var (
 		batch   server.EventBatch
 		compact int64
+		arena   byteArena
 	)
 	defer rows.Close()
 
 	for rows.Next() {
-		event, err := scan(rows, &batch.CurrentRev, &compact, val, prev)
+		event, err := scan(rows, &batch.CurrentRev, &compact, val, prev, &arena)
 		if err != nil {
 			return batch, 0, err
 		}
@@ -733,13 +786,14 @@ func (s *SQLLog) Append(ctx context.Context, event *server.Event) (int64, error)
 
 // scan scans the current row's columns into a server.Event struct.
 // If a valid event is scanned, the passed rev and compact vars are also updated.
-func scan(rows *sql.Rows, rev *int64, compact *int64, val, prev bool) (*server.Event, error) {
+func scan(rows *sql.Rows, rev *int64, compact *int64, val, prev bool, arena *byteArena) (*server.Event, error) {
 	event := &server.Event{
-		KV:     &server.KeyValue{},
-		PrevKV: &server.KeyValue{},
+		KV: &server.KeyValue{},
 	}
-	currentRev := &sql.NullInt64{}
-	compactRev := &sql.NullInt64{}
+	if prev {
+		event.PrevKV = &server.KeyValue{}
+	}
+	dest := scanDests{}
 	colCount := 9
 	if val {
 		colCount++
@@ -748,39 +802,53 @@ func scan(rows *sql.Rows, rev *int64, compact *int64, val, prev bool) (*server.E
 		}
 	}
 
-	dests := make([]any, colCount)
-	dests[0] = currentRev
-	dests[1] = compactRev
+	var dests [11]any
+	dests[0] = &dest.cur
+	dests[1] = &dest.compact
 	dests[2] = &event.KV.ModRevision
 	dests[3] = &event.KV.Key
 	dests[4] = &event.Create
 	dests[5] = &event.Delete
 	dests[6] = &event.KV.CreateRevision
-	dests[7] = &event.PrevKV.ModRevision
+	if prev {
+		dests[7] = &event.PrevKV.ModRevision
+	} else {
+		// prev_revision is still scanned (it drives pagination and delete
+		// detection), but the PrevKV row itself is not needed off the watch
+		// path
+		dests[7] = &dest.prevMod
+	}
 	dests[8] = &event.KV.Lease
 	if val {
-		dests[9] = &event.KV.Value
+		dests[9] = &dest.value
 		if prev {
-			dests[10] = &event.PrevKV.Value
+			dests[10] = &dest.prevVal
 		}
 	}
 
-	err := rows.Scan(dests...)
+	err := rows.Scan(dests[:colCount]...)
 	if err != nil {
 		return nil, err
+	}
+
+	if val {
+		event.KV.Value = arena.clone(dest.value)
+		if prev {
+			event.PrevKV.Value = arena.clone(dest.prevVal)
+		}
 	}
 
 	if event.Create {
 		event.KV.CreateRevision = event.KV.ModRevision
 		event.PrevKV = nil
-	} else {
+	} else if prev {
 		event.PrevKV.CreateRevision = event.KV.CreateRevision
 		event.PrevKV.Lease = event.KV.Lease
 		event.PrevKV.Key = event.KV.Key
 	}
 
-	*rev = currentRev.Int64
-	*compact = compactRev.Int64
+	*rev = dest.cur.Int64
+	*compact = dest.compact.Int64
 	return event, nil
 }
 
