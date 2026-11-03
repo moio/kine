@@ -560,9 +560,29 @@ func RowsToEvents(rows server.RowSet, val, prev bool) (server.EventBatch, int64,
 	// pgx-native rows expose the raw wire-format values; when they do and
 	// every field is binary-encoded, scan each row directly from the wire
 	// bytes instead of routing through Scan's interface boxing.
-	fast := rows.Binary() && rows.RawValues() != nil
+	// RawValues() is populated per row and only valid after the first Next(),
+	// so the gate is evaluated lazily from the first row: all rows of one
+	// result set share the field descriptions, and the pre-Next check used
+	// before OPTIMIZATION_ROUND_4.md forced every result set down the
+	// fallback scanner.
+	var (
+		fast    bool
+		checked bool
+	)
 
 	for rows.Next() {
+		if !checked {
+			checked = true
+			switch {
+			case rows.Binary() && len(rows.RawValues()) > 0:
+				fast = true
+				metrics.ScanMode.WithLabelValues("fast", "").Inc()
+			case rows.Binary():
+				metrics.ScanMode.WithLabelValues("scan", "no_raw_values").Inc()
+			default:
+				metrics.ScanMode.WithLabelValues("scan", "text_format").Inc()
+			}
+		}
 		var (
 			event *server.Event
 			err   error
@@ -576,6 +596,11 @@ func RowsToEvents(rows server.RowSet, val, prev bool) (server.EventBatch, int64,
 			return batch, 0, err
 		}
 		batch.Events = append(batch.Events, event)
+	}
+	// a read cut short by a cancelled query or a dropped connection must not
+	// reach the caller as a complete result
+	if err := rows.Err(); err != nil {
+		return batch, 0, err
 	}
 
 	return batch, compact, nil
@@ -818,17 +843,10 @@ func decInt4(b []byte) int64 {
 	return int64(int32(binary.BigEndian.Uint32(b)))
 }
 
-func decBytea(b []byte) []byte {
-	if len(b) < 4 {
-		return nil
-	}
-	plen := int(binary.BigEndian.Uint32(b[:4]))
-	if plen != len(b)-4 {
-		// shouldn't happen for well-formed wire data; fail safe
-		return nil
-	}
-	return b[4:]
-}
+// Note on bytea columns: pgx strips the wire framing before RawValues, so a
+// binary-format bytea value is the raw payload with NO in-band 4-byte length
+// prefix (a decoder that strips one corrupts data; pgtype.Bytea behaves the
+// same). NULLs are reported as nil slices and stay nil through the arena.
 
 // scanFast builds a server.Event directly from a row's raw wire-format
 // values (PostgreSQL binary format, as exposed by pgx Rows.RawValues).
@@ -858,10 +876,10 @@ func scanFast(raws [][]byte, rev *int64, compact *int64, val, prev bool, arena *
 		event.PrevKV.ModRevision = prevMod
 	}
 	if val && len(raws) > 9 {
-		event.KV.Value = arena.clone(decBytea(raws[9]))
+		event.KV.Value = arena.clone(raws[9]) // bytea: raw payload, nil for NULL
 	}
 	if prev && len(raws) > 10 {
-		event.PrevKV.Value = arena.clone(decBytea(raws[10]))
+		event.PrevKV.Value = arena.clone(raws[10])
 	}
 
 	if event.Create {

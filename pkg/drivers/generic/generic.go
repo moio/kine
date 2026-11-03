@@ -391,7 +391,14 @@ func (d *Generic) query(ctx context.Context, sql *query.Named, args ...any) (res
 		metrics.ObserveSQL(startTime, d.ErrCode(err), 0, query)
 	}()
 	if d.PgxPool != nil {
-		rows, err := d.PgxPool.Query(ctx, q, args...)
+		// force the binary wire format for every result column: the raw-value
+		// fast path in sqllog only interprets binary-encoded values, and pgx
+		// defaults text columns (e.g. `name`) to text format, which alone
+		// would push every result set onto the fallback scanner
+		queryArgs := make([]any, 0, len(args)+1)
+		queryArgs = append(queryArgs, pgx.QueryResultFormats{pgx.BinaryFormatCode})
+		queryArgs = append(queryArgs, args...)
+		rows, err := d.PgxPool.Query(ctx, q, queryArgs...)
 		if err != nil {
 			return nil, err
 		}

@@ -28,6 +28,11 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.001, 2, 14),
 	}, []string{"name", "error_code"})
 
+	ScanMode = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kine_scan_mode_total",
+		Help: "Result sets by row decoding mode: fast (raw wire-format values) vs scan (fallback scanner), with the fallback reason",
+	}, []string{"mode", "reason"})
+
 	CompactTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kine_compact_total",
 		Help: "Total number of compactions",

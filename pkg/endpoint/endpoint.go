@@ -114,6 +114,7 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 			metrics.SQLTime,
 			metrics.CompactTotal,
 			metrics.InsertErrorsTotal,
+			metrics.ScanMode,
 		)
 	}
 
