@@ -386,6 +386,7 @@ func (d *Generic) query(ctx context.Context, sql *query.Named, args ...any) (res
 	q := d.substituteCachedRevs(sql.Name, sql.Query)
 	query := sql.Fill(args)
 	logrus.Tracef("QUERY: %s", query)
+	logrus.Tracef("QUERY PLACEHOLDERS: %s /* %s */", q, sql.Name)
 	startTime := time.Now()
 	defer func() {
 		metrics.ObserveSQL(startTime, d.ErrCode(err), 0, query)
@@ -416,6 +417,7 @@ func (d *Generic) queryRow(ctx context.Context, sql *query.Named, args ...any) (
 	q := d.substituteCachedRevs(sql.Name, sql.Query)
 	query := sql.Fill(args)
 	logrus.Tracef("QUERY ROW: %s", query)
+	logrus.Tracef("QUERY ROW PLACEHOLDERS: %s /* %s */", q, sql.Name)
 	startTime := time.Now()
 	defer func() {
 		metrics.ObserveSQL(startTime, d.ErrCode(result.Err()), 0, query)
