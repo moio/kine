@@ -212,6 +212,27 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 	poolCfg.MaxConnLifetime = connPoolConfig.MaxLifetime
 	poolCfg.MaxConnIdleTime = connPoolConfig.MaxIdleTime
 
+	// OPTIMIZATION_ROUND_6.md R6-2: optional per-session cap on parallel
+	// query workers. The R5 history matrix showed the planner flipping the
+	// wide ListCurrentVal query to a parallel Gather Merge at low history
+	// depth (EXPLAIN: 2 workers, external-merge sort spill of 5.4 MB, and
+	// the slowest single-shot execution of the three depths) while the
+	// non-parallel nested-loop plan served the same shape at depth >= 4.
+	// Parallel workers are spawned per query, so under high client
+	// concurrency the spawn/context-switch cost multiplies. Default is
+	// unset (PostgreSQL's own default), so behavior is unchanged unless
+	// the operator opts in.
+	if v := os.Getenv("KINE_PGSQL_MAX_PARALLEL_WORKERS_PER_GATHER"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("KINE_PGSQL_MAX_PARALLEL_WORKERS_PER_GATHER must be a non-negative integer, got %q", v)
+		}
+		poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			_, err := conn.Exec(ctx, "SET max_parallel_workers_per_gather = "+strconv.Itoa(n))
+			return err
+		}
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, err
