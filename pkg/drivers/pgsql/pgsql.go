@@ -22,6 +22,7 @@ import (
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/logstructured"
 	"github.com/k3s-io/kine/pkg/logstructured/sqllog"
+	"github.com/k3s-io/kine/pkg/metrics"
 	"github.com/k3s-io/kine/pkg/query"
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/k3s-io/kine/pkg/tls"
@@ -79,6 +80,78 @@ var (
 	listSQL    = fmt.Sprintf(listFmt, generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns, distinctNameSQL, query.LimitToken)
 	listValSQL = fmt.Sprintf(listFmt, generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal, distinctNameSQL, query.LimitToken)
 
+	// Current-state mirror-table variants (OPTIMIZATION_ROUND_8.md Track B,
+	// enabled by KINE_PGSQL_CURRENT_STATE). These serve the same call sites
+	// and parameter lists as the history-backed queries above, but read
+	// kine_current, which the kine_current_maintain trigger maintains as the
+	// transactionally committed latest row per key. Deleted keys are
+	// represented by their tombstone row (deleted = 1) so that the
+	// deleted = 0 filter reproduces the history query's select-latest-then-
+	// test-deletion semantics; requests that ask for tombstones
+	// (includeDeleted) are served from the history log by the dialect
+	// wrapper below.
+	currentAllFmt = `
+		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		FROM kine_current
+		WHERE deleted = 0
+		ORDER BY name ASC`
+	currentGetFmt = `
+		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		FROM kine_current
+		WHERE name = ? AND deleted = 0`
+	currentListFmt = `
+		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		FROM kine_current
+		WHERE name >= ? AND name < ? AND deleted = 0
+		ORDER BY name ASC %s`
+	currentCountFmt = `
+		SELECT (%s), COUNT(id)
+		FROM kine_current
+		WHERE name >= ? AND name < ? AND deleted = 0`
+	currentCountAllFmt = `
+		SELECT (%s), COUNT(id)
+		FROM kine_current
+		WHERE deleted = 0`
+
+	// Schema for the current-state mirror. Every committed revision insert
+	// on kine upserts the same transaction's row into kine_current, so the
+	// mirror becomes visible exactly when the history row does and can never
+	// reference an uncommitted revision. The WHERE cur.id < EXCLUDED.id
+	// guard makes the mirror monotonic per key: a late-committing lower
+	// revision can never overwrite a newer committed one.
+	currentStateSchema = []string{
+		`CREATE TABLE IF NOT EXISTS kine_current (
+			id BIGINT NOT NULL,
+			name TEXT COLLATE "C" NOT NULL,
+			created INTEGER,
+			deleted INTEGER,
+			create_revision BIGINT,
+			prev_revision BIGINT,
+			lease INTEGER,
+			value BYTEA,
+			CONSTRAINT kine_current_pkey PRIMARY KEY (name)
+		);`,
+		`CREATE OR REPLACE FUNCTION kine_current_maintain() RETURNS trigger AS $func$
+		BEGIN
+			INSERT INTO kine_current AS cur (id, name, created, deleted, create_revision, prev_revision, lease, value)
+			VALUES (NEW.id, NEW.name, NEW.created, NEW.deleted, NEW.create_revision, NEW.prev_revision, NEW.lease, NEW.value)
+			ON CONFLICT (name) DO UPDATE SET
+				id = EXCLUDED.id,
+				created = EXCLUDED.created,
+				deleted = EXCLUDED.deleted,
+				create_revision = EXCLUDED.create_revision,
+				prev_revision = EXCLUDED.prev_revision,
+				lease = EXCLUDED.lease,
+				value = EXCLUDED.value
+			WHERE cur.id < EXCLUDED.id;
+			RETURN NEW;
+		END;
+		$func$ LANGUAGE plpgsql;`,
+		`DROP TRIGGER IF EXISTS kine_current_maintain ON kine;`,
+		`CREATE TRIGGER kine_current_maintain AFTER INSERT ON kine
+		FOR EACH ROW EXECUTE FUNCTION kine_current_maintain();`,
+	}
+
 	schemaMigrations = []string{
 		`ALTER TABLE kine ALTER COLUMN id SET DATA TYPE BIGINT, ALTER COLUMN create_revision SET DATA TYPE BIGINT, ALTER COLUMN prev_revision SET DATA TYPE BIGINT; ALTER SEQUENCE kine_id_seq AS BIGINT`,
 		// It is important to set the collation to "C" to ensure that LIKE and COMPARISON
@@ -87,6 +160,183 @@ var (
 	}
 	createDB = `CREATE DATABASE "%s";`
 )
+
+// currentStateDialect serves current-state reads from the kine_current
+// mirror table while delegating everything else to the wrapped Generic.
+// The mirror queries are built by newCurrentStateDialect; the embedded
+// Generic keeps the history-backed query set, which is what the
+// includeDeleted fallback below must use.
+type currentStateDialect struct {
+	*generic.Generic
+
+	currentAllSQL     *query.Named
+	currentAllValSQL  *query.Named
+	currentGetSQL     *query.Named
+	currentGetValSQL  *query.Named
+	currentListSQL    *query.Named
+	currentListValSQL *query.Named
+	currentCountSQL   *query.Named
+}
+
+func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
+	return &currentStateDialect{
+		Generic: dialect,
+		currentAllSQL: query.New(fmt.Sprintf(currentAllFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "AllCurrent"),
+		currentAllValSQL: query.New(fmt.Sprintf(currentAllFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "AllCurrentVal"),
+		currentGetSQL: query.New(fmt.Sprintf(currentGetFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "GetSingle"),
+		currentGetValSQL: query.New(fmt.Sprintf(currentGetFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "GetSingleVal"),
+		currentListSQL: query.New(fmt.Sprintf(currentListFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns, query.LimitToken), "$", true, "ListCurrent"),
+		currentListValSQL: query.New(fmt.Sprintf(currentListFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal, query.LimitToken), "$", true, "ListCurrentVal"),
+		currentCountSQL: query.New(fmt.Sprintf(currentCountFmt, generic.CurrentRevSQL), "$", true, "CountCurrent"),
+	}
+}
+
+// currentStateReads reports whether current-state reads are served from the
+// kine_current mirror table.
+func currentStateReads() bool {
+	v := os.Getenv("KINE_PGSQL_CURRENT_STATE")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// setupCurrentState creates the mirror schema and verifies that kine_current
+// agrees with the history log before any current read may use it
+// (OPTIMIZATION_ROUND_8.md B4). It runs at startup, before kine admits
+// traffic, under the single-instance deployment scope: no other kine or
+// external writer may be active while the rebuild executes.
+func setupCurrentState(db *sql.DB) error {
+	for _, stmt := range currentStateSchema {
+		logrus.Tracef("SETUP EXEC CURRENT STATE: %v", query.Strip(stmt))
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("current-state schema setup: %w", err)
+		}
+	}
+
+	var (
+		maxHist sql.NullInt64
+		maxCur  sql.NullInt64
+	)
+	if err := db.QueryRow(`SELECT (SELECT MAX(id) FROM kine), (SELECT MAX(id) FROM kine_current)`).Scan(&maxHist, &maxCur); err != nil {
+		return fmt.Errorf("current-state bootstrap check: %w", err)
+	}
+
+	// max(id) equality between log and mirror is the primary invariant:
+	// every history insert mirrors itself, including tombstones.
+	needsRebuild := false
+	if maxHist.Valid && maxHist.Int64 > 0 {
+		needsRebuild = !maxCur.Valid || maxCur.Int64 != maxHist.Int64
+	} else if maxCur.Valid && maxCur.Int64 > 0 {
+		needsRebuild = true // empty log with a non-empty mirror
+	}
+
+	if !needsRebuild && maxHist.Valid && maxHist.Int64 > 0 {
+		// max(id) equality is necessary but not sufficient: require exactly
+		// one mirror row per distinct history key (catches intermediate
+		// drift from, e.g., a writer that ran without the trigger).
+		var curCount, histKeys int64
+		if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM kine_current), (SELECT COUNT(DISTINCT name) FROM kine)`).Scan(&curCount, &histKeys); err != nil {
+			return fmt.Errorf("current-state bootstrap check: %w", err)
+		}
+		needsRebuild = curCount != histKeys
+	}
+
+	if !needsRebuild {
+		logrus.Infof("kine_current mirror verified against history log (max revision %d)", maxHist.Int64)
+		return nil
+	}
+
+	logrus.Infof("kine_current mirror is out of sync with the history log (log max %s, mirror max %s); rebuilding before traffic is admitted",
+		nullInt64Str(maxHist), nullInt64Str(maxCur))
+	xTx, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return err
+	}
+	defer xTx.Rollback()
+	if _, err := xTx.Exec(`DELETE FROM kine_current`); err != nil {
+		return err
+	}
+	if _, err := xTx.Exec(`INSERT INTO kine_current (id, name, created, deleted, create_revision, prev_revision, lease, value)
+		SELECT DISTINCT ON (name) id, name, created, deleted, create_revision, prev_revision, lease, value
+		FROM kine ORDER BY name ASC, id DESC`); err != nil {
+		return err
+	}
+	var n int64
+	if err := xTx.QueryRow(`SELECT COUNT(*) FROM kine_current`).Scan(&n); err != nil {
+		return err
+	}
+	if err := xTx.Commit(); err != nil {
+		return err
+	}
+	logrus.Infof("kine_current rebuilt from history: %d rows", n)
+	return nil
+}
+
+func nullInt64Str(v sql.NullInt64) string {
+	if !v.Valid {
+		return "NULL"
+	}
+	return strconv.FormatInt(v.Int64, 10)
+}
+
+func (d *currentStateDialect) CountCurrent(ctx context.Context, key, end string) (int64, int64, error) {
+	metrics.CurrentStateReads.WithLabelValues("count").Inc()
+	var (
+		rev   sql.NullInt64
+		count int64
+	)
+	if err := d.Generic.QueryRowNamed(ctx, d.currentCountSQL, key, end).Scan(&rev, &count); err != nil {
+		return 0, 0, err
+	}
+	return rev.Int64, count, nil
+}
+
+func (d *currentStateDialect) ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (server.RowSet, error) {
+	// History remains authoritative whenever tombstones are requested: the
+	// mirror keeps tombstone rows whose history rows compaction may have
+	// removed, so post-compaction includeDeleted semantics are only exact on
+	// the log. Internal users of includeDeleted on current reads (e.g. the
+	// existence check in Create) get the unchanged history behavior.
+	if includeDeleted {
+		metrics.CurrentStateReads.WithLabelValues("history_fallback").Inc()
+		return d.Generic.ListCurrent(ctx, key, end, limit, includeDeleted, keysOnly)
+	}
+
+	var (
+		variant string
+		sqlq    *query.Named
+		args    []any
+	)
+	switch {
+	case key == "":
+		if keysOnly {
+			variant, sqlq = "all_keys_only", d.currentAllSQL
+		} else {
+			variant, sqlq = "all_value", d.currentAllValSQL
+		}
+	case end == "":
+		if keysOnly {
+			variant, sqlq = "get_keys_only", d.currentGetSQL
+		} else {
+			variant, sqlq = "get_value", d.currentGetValSQL
+		}
+		args = append(args, key)
+	default:
+		if keysOnly {
+			variant, sqlq = "list_keys_only", d.currentListSQL
+		} else {
+			variant, sqlq = "list_value", d.currentListValSQL
+		}
+		sqlq = sqlq.WithLimit(limit)
+		args = append(args, key, end)
+	}
+	metrics.CurrentStateReads.WithLabelValues(variant).Inc()
+	return d.Generic.QueryNamed(ctx, sqlq, args...)
+}
 
 func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
 	config, err := prepareConfig(cfg.DataSourceName, cfg.BackendTLSConfig)
@@ -177,8 +427,17 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		return false, nil, err
 	}
 
+	backend := server.Dialect(dialect)
+	if currentStateReads() {
+		if err := setupCurrentState(dialect.DB); err != nil {
+			return false, nil, err
+		}
+		backend = newCurrentStateDialect(dialect)
+		logrus.Info("current-state table reads enabled (KINE_PGSQL_CURRENT_STATE): current GET/LIST/COUNT are served from kine_current; includeDeleted and revision-bounded reads remain on the history log")
+	}
+
 	dialect.Migrate(context.Background())
-	return true, logstructured.New(sqllog.New(dialect, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+	return true, logstructured.New(sqllog.New(backend, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
 }
 
 // nativeReads reports whether the pgx-native read path is enabled.

@@ -33,6 +33,11 @@ var (
 		Help: "Result sets by row decoding mode: fast (raw wire-format values) vs scan (fallback scanner), with the fallback reason",
 	}, []string{"mode", "reason"})
 
+	CurrentStateReads = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kine_current_state_reads_total",
+		Help: "Current-state reads by serving variant: current-table read (all_*/get_*/list_*/count*) or history fallback (history_fallback)",
+	}, []string{"variant"})
+
 	CompactTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kine_compact_total",
 		Help: "Total number of compactions",

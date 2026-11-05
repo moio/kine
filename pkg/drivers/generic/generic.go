@@ -74,9 +74,9 @@ type ConnectionPoolConfig struct {
 type Generic struct {
 	sync.Mutex
 
-	LockWrites              bool
-	LastInsertID            bool
-	DB                      *sql.DB
+	LockWrites   bool
+	LastInsertID bool
+	DB           *sql.DB
 	// PgxPool, when set, routes read queries (List/ListCurrent/After)
 	// through a pgx-native connection pool instead of database/sql,
 	// enabling raw wire-format scanning. Write queries always use DB.
@@ -348,12 +348,12 @@ type sqlRowSet struct {
 	rows *sql.Rows
 }
 
-func (r *sqlRowSet) Next() bool                { return r.rows.Next() }
-func (r *sqlRowSet) Scan(dest ...any) error    { return r.rows.Scan(dest...) }
-func (r *sqlRowSet) Close()                    { r.rows.Close() }
-func (r *sqlRowSet) Err() error                { return r.rows.Err() }
-func (r *sqlRowSet) RawValues() [][]byte       { return nil }
-func (r *sqlRowSet) Binary() bool              { return false }
+func (r *sqlRowSet) Next() bool             { return r.rows.Next() }
+func (r *sqlRowSet) Scan(dest ...any) error { return r.rows.Scan(dest...) }
+func (r *sqlRowSet) Close()                 { r.rows.Close() }
+func (r *sqlRowSet) Err() error             { return r.rows.Err() }
+func (r *sqlRowSet) RawValues() [][]byte    { return nil }
+func (r *sqlRowSet) Binary() bool           { return false }
 
 // pgxRowSet adapts pgx.Rows to server.RowSet, exposing raw wire-format
 // values. The values alias pgx's connection read buffer and are only
@@ -374,12 +374,12 @@ func newPgxRowSet(rows pgx.Rows) *pgxRowSet {
 	return r
 }
 
-func (r *pgxRowSet) Next() bool          { return r.rows.Next() }
+func (r *pgxRowSet) Next() bool             { return r.rows.Next() }
 func (r *pgxRowSet) Scan(dest ...any) error { return r.rows.Scan(dest...) }
-func (r *pgxRowSet) Close()              { r.rows.Close() }
-func (r *pgxRowSet) Err() error          { return r.rows.Err() }
-func (r *pgxRowSet) RawValues() [][]byte { return r.rows.RawValues() }
-func (r *pgxRowSet) Binary() bool        { return r.bin }
+func (r *pgxRowSet) Close()                 { r.rows.Close() }
+func (r *pgxRowSet) Err() error             { return r.rows.Err() }
+func (r *pgxRowSet) RawValues() [][]byte    { return r.rows.RawValues() }
+func (r *pgxRowSet) Binary() bool           { return r.bin }
 
 func (d *Generic) query(ctx context.Context, sql *query.Named, args ...any) (result server.RowSet, err error) {
 	d.startRevCacheRefresher()
@@ -423,6 +423,20 @@ func (d *Generic) queryRow(ctx context.Context, sql *query.Named, args ...any) (
 		metrics.ObserveSQL(startTime, d.ErrCode(result.Err()), 0, query)
 	}()
 	return d.DB.QueryRowContext(ctx, q, args...)
+}
+
+// QueryNamed executes a pre-built named query and returns the result rows.
+// It exists so driver implementations that wrap Generic can serve alternate
+// query shapes at the same call sites (for example a current-state mirror
+// table) while reusing the pool routing, tracing and metrics of this type.
+func (d *Generic) QueryNamed(ctx context.Context, sql *query.Named, args ...any) (server.RowSet, error) {
+	return d.query(ctx, sql, args...)
+}
+
+// QueryRowNamed executes a pre-built named query that is expected to return
+// at most one row. See QueryNamed.
+func (d *Generic) QueryRowNamed(ctx context.Context, sql *query.Named, args ...any) *sql.Row {
+	return d.queryRow(ctx, sql, args...)
 }
 
 func (d *Generic) execute(ctx context.Context, sql *query.Named, args ...any) (result sql.Result, err error) {
