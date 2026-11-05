@@ -88,8 +88,9 @@ var (
 	// represented by their tombstone row (deleted = 1) so that the
 	// deleted = 0 filter reproduces the history query's select-latest-then-
 	// test-deletion semantics; requests that ask for tombstones
-	// (includeDeleted) are served from the history log by the dialect
-	// wrapper below.
+	// Tombstone-inclusive single-key existence checks (Create/Delete) are
+	// served from the mirror itself (see currentGetDelFmt); includeDeleted
+	// range reads remain on the history log by the dialect wrapper below.
 	currentAllFmt = `
 		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
 		FROM kine_current
@@ -99,6 +100,21 @@ var (
 		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
 		FROM kine_current
 		WHERE name = ? AND deleted = 0`
+	// Tombstone-inclusive single-key variants: the mirror always holds the
+	// latest committed row per key, tombstone or not, so these variants are
+	// authoritative for the includeDeleted existence checks in Create/Delete
+	// (logstructured.get with revision=0, end="", limit=1). History cannot
+	// answer these after compaction: the PostgreSQL CompactSQL deletes every
+	// tombstone row in the compact window unconditionally, even when it is a
+	// key's latest revision, after which the log has no trace of the key.
+	// Serving the check from the mirror preserves the uncompacted semantics
+	// (and etcd's): Create sees deleted=1 and proceeds; Delete of an already
+	// deleted key reports deleted=false, matching etcd, instead of the
+	// post-compaction history answer deleted=true.
+	currentGetDelFmt = `
+		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		FROM kine_current
+		WHERE name = ?`
 	currentListFmt = `
 		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
 		FROM kine_current
@@ -169,13 +185,15 @@ var (
 type currentStateDialect struct {
 	*generic.Generic
 
-	currentAllSQL     *query.Named
-	currentAllValSQL  *query.Named
-	currentGetSQL     *query.Named
-	currentGetValSQL  *query.Named
-	currentListSQL    *query.Named
-	currentListValSQL *query.Named
-	currentCountSQL   *query.Named
+	currentAllSQL       *query.Named
+	currentAllValSQL    *query.Named
+	currentGetSQL       *query.Named
+	currentGetValSQL    *query.Named
+	currentGetDelSQL    *query.Named
+	currentGetDelValSQL *query.Named
+	currentListSQL      *query.Named
+	currentListValSQL   *query.Named
+	currentCountSQL     *query.Named
 }
 
 func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
@@ -189,6 +207,10 @@ func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
 			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "GetSingle"),
 		currentGetValSQL: query.New(fmt.Sprintf(currentGetFmt,
 			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "GetSingleVal"),
+		currentGetDelSQL: query.New(fmt.Sprintf(currentGetDelFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "GetSingleDel"),
+		currentGetDelValSQL: query.New(fmt.Sprintf(currentGetDelFmt,
+			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "GetSingleDelVal"),
 		currentListSQL: query.New(fmt.Sprintf(currentListFmt,
 			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns, query.LimitToken), "$", true, "ListCurrent"),
 		currentListValSQL: query.New(fmt.Sprintf(currentListFmt,
@@ -296,14 +318,25 @@ func (d *currentStateDialect) CountCurrent(ctx context.Context, key, end string)
 }
 
 func (d *currentStateDialect) ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (server.RowSet, error) {
-	// History remains authoritative whenever tombstones are requested: the
-	// mirror keeps tombstone rows whose history rows compaction may have
-	// removed, so post-compaction includeDeleted semantics are only exact on
-	// the log. Internal users of includeDeleted on current reads (e.g. the
-	// existence check in Create) get the unchanged history behavior.
+	// Tombstone-inclusive single-key reads are the internal existence checks
+	// in Create/Delete (logstructured.get with revision=0, end="", limit=1).
+	// The mirror is authoritative for them: it retains tombstones that the
+	// PostgreSQL compaction statement removes from the log even when they are
+	// a key's latest revision, so the mirror answer matches uncompacted (and
+	// etcd) semantics at every compaction state. Tombstone-inclusive RANGE
+	// reads (end != "") have no internal caller at current state; keep them
+	// on the history log.
 	if includeDeleted {
-		metrics.CurrentStateReads.WithLabelValues("history_fallback").Inc()
-		return d.Generic.ListCurrent(ctx, key, end, limit, includeDeleted, keysOnly)
+		if end != "" {
+			metrics.CurrentStateReads.WithLabelValues("history_fallback_range").Inc()
+			return d.Generic.ListCurrent(ctx, key, end, limit, includeDeleted, keysOnly)
+		}
+		if keysOnly {
+			metrics.CurrentStateReads.WithLabelValues("get_del_keys_only").Inc()
+			return d.Generic.QueryNamed(ctx, d.currentGetDelSQL, key)
+		}
+		metrics.CurrentStateReads.WithLabelValues("get_del_value").Inc()
+		return d.Generic.QueryNamed(ctx, d.currentGetDelValSQL, key)
 	}
 
 	var (
