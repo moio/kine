@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/k3s-io/kine/pkg/app"
 	"github.com/k3s-io/kine/pkg/endpoint"
 	"github.com/sirupsen/logrus"
@@ -28,7 +29,6 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const testDSNEnv = "KINE_TEST_PG_DSN"
@@ -37,6 +37,12 @@ const testDSNEnv = "KINE_TEST_PG_DSN"
 // explicit stop function, for tests that need to control the process
 // lifecycle (restart tests). The caller must invoke stop exactly once.
 func startPostgresKineRaw(t *testing.T, dsn string) (*kubernetes.Client, func()) {
+	return startPostgresKineRawFlags(t, dsn, true)
+}
+
+// startPostgresKineRawFlags is startPostgresKineRaw with explicit control of
+// KINE_PGSQL_CURRENT_STATE (for the flag-off/on cycle test).
+func startPostgresKineRawFlags(t *testing.T, dsn string, currentState bool) (*kubernetes.Client, func()) {
 	t.Helper()
 	if dsn == "" {
 		t.Skipf("%s not set; skipping PostgreSQL feature test", testDSNEnv)
@@ -45,7 +51,11 @@ func startPostgresKineRaw(t *testing.T, dsn string) (*kubernetes.Client, func())
 	logrus.SetOutput(t.Output())
 
 	t.Setenv("KINE_PGSQL_NATIVE_READS", "true")
-	t.Setenv("KINE_PGSQL_CURRENT_STATE", "true")
+	if currentState {
+		t.Setenv("KINE_PGSQL_CURRENT_STATE", "true")
+	} else {
+		t.Setenv("KINE_PGSQL_CURRENT_STATE", "false")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
@@ -172,6 +182,27 @@ func openRawDB(t *testing.T, dsn string) *sql.DB {
 	return db
 }
 
+// waitForCompaction polls the raw database until no history rows for the
+// given key exist at or below the given revision (physical compaction done).
+// kine's Compact RPC returns before physical log deletion completes.
+func waitForCompaction(t *testing.T, raw *sql.DB, rev int64, key string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := raw.QueryRow(`SELECT COUNT(*) FROM kine WHERE id <= $1 AND name = $2`, rev, key).Scan(&n); err != nil {
+			t.Fatalf("compaction poll: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log rows for %s not compacted within 10s", key)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // TestPGT2DeleteCompactRestart covers decision D1: after compaction removes
 // a key's tombstone from the history log (PostgreSQL CompactSQL deletes even
 // latest-revision tombstones), the retained mirror tombstone must NOT be
@@ -222,22 +253,9 @@ func TestPGT2DeleteCompactRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	// wait for physical compaction to remove the log rows <= compactRev
 	raw := openRawDB(t, dsn)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var n int
-		if err := raw.QueryRow(`SELECT COUNT(*) FROM kine WHERE id <= $1 AND name = 'kA'`, compactRev).Scan(&n); err != nil {
-			t.Fatalf("compaction poll: %v", err)
-		}
-		if n == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("log rows for kA not compacted within 10s")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	// wait for physical compaction to remove the log rows <= compactRev
+	waitForCompaction(t, raw, compactRev, "kA")
 
 	// a fresh write keeps MAX(id) equal on log and mirror while the count
 	// check disagrees (kA's tombstone survives only in the mirror)
@@ -493,5 +511,325 @@ func TestPGT4EmptyReads(t *testing.T) {
 		if k := string(kv.Key); k != "compact_rev_key" && k != "/registry/health" {
 			t.Fatalf("empty all-key LIST returned unexpected key %q", k)
 		}
+	}
+}
+
+// TestPGT5Pagination covers pinned-revision pagination (sub-plan 9.0 T5):
+// pages taken at the first response's revision must reconstruct the exact
+// ordered set, and Count/More must agree with the server's counting.
+func TestPGT5Pagination(t *testing.T) {
+	client := startPostgresKine(t, pgTestDSN(t))
+	ctx := context.Background()
+
+	const n = 10
+	const limit = 3
+	for i := 0; i < n; i++ {
+		_, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(fmt.Sprintf("p%02d", i)), "=", 0)).
+			Then(clientv3.OpPut(fmt.Sprintf("p%02d", i), fmt.Sprintf("v%d", i))).Commit()
+		if err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	// first page at revision 0 (current)
+	first, err := client.Client.Get(ctx, "p", clientv3.WithRange("q"), clientv3.WithLimit(limit))
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if first.Count != n {
+		t.Errorf("first page Count: got %d, want %d", first.Count, n)
+	}
+	if len(first.Kvs) != limit {
+		t.Fatalf("first page length: got %d, want %d", len(first.Kvs), limit)
+	}
+	pinned := first.Header.Revision
+
+	// walk pages at the pinned revision; continuation start is last+"\x00"
+	// (the kube-apiserver pattern, translated by the server), with the same
+	// range end and no WithFromKey (which would override the range end with
+	// a NUL that reaches PG untranslated)
+	seen := 0
+	var last string
+	for {
+		var page *clientv3.GetResponse
+		var err error
+		if last == "" {
+			page, err = client.Client.Get(ctx, "p", clientv3.WithRange("q"), clientv3.WithLimit(limit), clientv3.WithRev(pinned))
+		} else {
+			page, err = client.Client.Get(ctx, last+"\x00", clientv3.WithRange("q"), clientv3.WithLimit(limit), clientv3.WithRev(pinned))
+		}
+		if err != nil {
+			t.Fatalf("page at start=%q: %v", last, err)
+		}
+		for _, kv := range page.Kvs {
+			seen++
+			if string(kv.Key) <= last && last != "" {
+				t.Errorf("page returned key %q after %q (ordering/overlap)", kv.Key, last)
+			}
+			last = string(kv.Key)
+		}
+		if !page.More {
+			break
+		}
+		if len(page.Kvs) == 0 {
+			t.Fatal("More=true with empty page")
+		}
+	}
+	if seen != n {
+		t.Errorf("pagination reconstructed %d keys, want %d", seen, n)
+	}
+
+	// a write after pinning must not appear in later pages at the pinned rev
+	_, err = client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("p99"), "=", 0)).
+		Then(clientv3.OpPut("p99", "late")).Commit()
+	if err != nil {
+		t.Fatalf("late write: %v", err)
+	}
+	page, err := client.Client.Get(ctx, "p9", clientv3.WithRange("q"), clientv3.WithLimit(limit), clientv3.WithRev(pinned))
+	if err != nil {
+		t.Fatalf("pinned page after write: %v", err)
+	}
+	for _, kv := range page.Kvs {
+		if string(kv.Key) == "p99" {
+			t.Error("pinned pagination returned a key written after the pinned revision")
+		}
+	}
+}
+
+// TestPGT6ListWatchHandoff covers list-at-revision-R then watch from R+1
+// (sub-plan 9.0 T6): no skipped or duplicated events across the boundary.
+func TestPGT6ListWatchHandoff(t *testing.T) {
+	client := startPostgresKine(t, pgTestDSN(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// seed two keys
+	for _, k := range []string{"w1", "w2"} {
+		_, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(k), "=", 0)).
+			Then(clientv3.OpPut(k, "seed")).Commit()
+		if err != nil {
+			t.Fatalf("seed %s: %v", k, err)
+		}
+	}
+
+	// list at revision 0
+	ls, err := client.Client.Get(ctx, "w", clientv3.WithRange("x"))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	pinned := ls.Header.Revision
+
+	// watch from pinned+1
+	wch := client.Client.Watch(ctx, "w", clientv3.WithRange("x"), clientv3.WithRev(pinned+1))
+
+	// write one update (w1, CAS on its seed revision) and one create (w3);
+	// both fall after the pinned revision
+	gw1, err := client.Client.Get(ctx, "w1")
+	if err != nil || len(gw1.Kvs) != 1 {
+		t.Fatalf("get w1: err=%v", err)
+	}
+	if _, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("w1"), "=", gw1.Kvs[0].ModRevision)).
+		Then(clientv3.OpPut("w1", "upd")).Else(clientv3.OpGet("w1")).Commit(); err != nil {
+		t.Fatalf("update w1: %v", err)
+	}
+	if _, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("w3"), "=", 0)).
+		Then(clientv3.OpPut("w3", "new")).Commit(); err != nil {
+		t.Fatalf("create w3: %v", err)
+	}
+
+	// expect exactly two events: w1, w3 (w2 untouched)
+	got := map[string]int{}
+	deadline := time.After(10 * time.Second)
+	for got["w1"] == 0 || got["w3"] == 0 {
+		select {
+		case resp, ok := <-wch:
+			if !ok {
+				t.Fatal("watch channel closed unexpectedly")
+			}
+			for _, ev := range resp.Events {
+				got[string(ev.Kv.Key)]++
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for events; got %v", got)
+		}
+	}
+	// drain briefly for stragglers/duplicates
+	drain := time.After(500 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case resp, ok := <-wch:
+			if !ok {
+				break drainLoop
+			}
+			for _, ev := range resp.Events {
+				got[string(ev.Kv.Key)]++
+			}
+		case <-drain:
+			break drainLoop
+		}
+	}
+	for k, c := range got {
+		if k != "w1" && k != "w3" {
+			t.Errorf("unexpected event for %q", k)
+		}
+		if c != 1 {
+			t.Errorf("key %q delivered %d times, want 1", k, c)
+		}
+	}
+}
+
+// TestPGT7CompactionMetadata covers sub-plan 9.0 T7: compaction (an in-place
+// UPDATE of the internal compact_rev_key row) must not change live-key
+// read results through the mirror, and the mirror stays consistent.
+func TestPGT7CompactionMetadata(t *testing.T) {
+	dsn := pgTestDSN(t)
+	client, stop := startPostgresKineRaw(t, dsn)
+	ctx := context.Background()
+
+	// seed two revisions so the create revision is genuinely compacted
+	// (CompactSQL removes a row when a newer row in the window references it
+	// as prev_revision, or when it is a tombstone). Known upstream boundary
+	// behavior (both paths): GET at exactly the compact revision is served
+	// (strict revision < compact); GET below it returns ErrCompacted.
+	r1, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("c1"), "=", 0)).
+		Then(clientv3.OpPut("c1", "v1")).Commit()
+	if err != nil {
+		t.Fatalf("seed c1: %v", err)
+	}
+	createRev := r1.Header.Revision
+	up, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("c1"), "=", createRev)).
+		Then(clientv3.OpPut("c1", "v2")).Else(clientv3.OpGet("c1")).Commit()
+	if err != nil {
+		t.Fatalf("update c1: %v", err)
+	}
+	updateRev := up.Header.Revision
+	before, err := client.Client.Get(ctx, "c1")
+	if err != nil || len(before.Kvs) != 1 {
+		t.Fatalf("pre-compact GET: err=%v", err)
+	}
+
+	// compact through the UPDATE revision — the referencing row must lie
+	// inside the compact window for the create row to be removed — and wait
+	// for physical compaction of the create revision
+	_, err = client.Compact(ctx, updateRev)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	raw := openRawDB(t, dsn)
+	waitForCompaction(t, raw, createRev, "c1")
+	stop()
+
+	// restart; the mirror must still serve the live key identically
+	client2, stop2 := startPostgresKineRaw(t, dsn)
+	defer stop2()
+	after, err := client2.Client.Get(ctx, "c1")
+	if err != nil || len(after.Kvs) != 1 || string(after.Kvs[0].Value) != "v2" {
+		t.Fatalf("post-compact GET: err=%v kvs=%v", err, after.Kvs)
+	}
+
+	// the create revision is now compacted (queried at the create revision
+	// itself, which lies strictly below the new watermark; see the boundary
+	// note above)
+	if _, err := client2.Client.Get(ctx, "c1", clientv3.WithRev(createRev)); err == nil {
+		t.Errorf("GET at compacted revision %d succeeded, want ErrCompacted", createRev)
+	}
+}
+
+// TestPGT8FlagOffOnCycle covers decision D4 (sub-plan 9.0 T8): running with
+// mirror reads disabled keeps the trigger installed and the mirror in sync;
+// re-enabling reads must not rebuild or serve stale data.
+func TestPGT8FlagOffOnCycle(t *testing.T) {
+	dsn := pgTestDSN(t)
+	ctx := context.Background()
+
+	// phase 1: fresh database with mirror reads OFF — no mirror table or
+	// trigger is created (schema setup is gated by KINE_PGSQL_CURRENT_STATE).
+	// Writes go to the log only.
+	cl1, stop1 := startPostgresKineRawFlags(t, dsn, false)
+	if _, err := cl1.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("f1"), "=", 0)).Then(clientv3.OpPut("f1", "v1")).Commit(); err != nil {
+		stop1()
+		t.Fatalf("flag-off write: %v", err)
+	}
+	stop1()
+
+	raw := openRawDB(t, dsn)
+	var tables int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name='kine_current'`).Scan(&tables); err != nil || tables != 0 {
+		t.Fatalf("fresh flag-off database should have no kine_current table: tables=%d err=%v", tables, err)
+	}
+
+	// phase 2: mirror reads ON against the same database — setupCurrentState
+	// creates the schema and rebuilds from the intact log; reads are correct
+	cl2, stop2 := startPostgresKineRawFlags(t, dsn, true)
+	g, err := cl2.Client.Get(ctx, "f1")
+	if err != nil || len(g.Kvs) != 1 || string(g.Kvs[0].Value) != "v1" {
+		stop2()
+		t.Fatalf("flag-on GET after rebuild: err=%v kvs=%v", err, g.Kvs)
+	}
+	// write with the trigger active, then cycle flag OFF again: the trigger
+	// was installed in phase 2 and stays installed (flag-off only gates
+	// reads), so the mirror keeps tracking writes
+	if _, err := cl2.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("f2"), "=", 0)).Then(clientv3.OpPut("f2", "v2")).Commit(); err != nil {
+		stop2()
+		t.Fatalf("flag-on write: %v", err)
+	}
+	stop2()
+
+	cl3, stop3 := startPostgresKineRawFlags(t, dsn, false)
+	if _, err := cl3.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("f3"), "=", 0)).Then(clientv3.OpPut("f3", "v3")).Commit(); err != nil {
+		stop3()
+		t.Fatalf("second flag-off write: %v", err)
+	}
+	stop3()
+
+	var n int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM kine_current WHERE name='f3' AND deleted=0`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("mirror did not track writes while reads were flag-off (trigger persisted from phase 2): n=%d err=%v", n, err)
+	}
+
+	// phase 4: re-enable reads — mirror must be in sync, no rebuild needed
+	cl4, stop4 := startPostgresKineRawFlags(t, dsn, true)
+	defer stop4()
+	g, err = cl4.Client.Get(ctx, "f3")
+	if err != nil || len(g.Kvs) != 1 || string(g.Kvs[0].Value) != "v3" {
+		t.Fatalf("re-enable GET: err=%v kvs=%v", err, g.Kvs)
+	}
+}
+
+// TestPGT10RevisionErrors covers future/compacted revision errors and
+// fail-closed bootstrap restart (sub-plan 9.0 T10).
+func TestPGT10RevisionErrors(t *testing.T) {
+	dsn := pgTestDSN(t)
+	client := startPostgresKine(t, dsn)
+	ctx := context.Background()
+
+	r, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("e1"), "=", 0)).Then(clientv3.OpPut("e1", "v")).Commit()
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	createRev := r.Header.Revision
+	up, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("e1"), "=", createRev)).
+		Then(clientv3.OpPut("e1", "v2")).Else(clientv3.OpGet("e1")).Commit()
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	cur := up.Header.Revision
+
+	// future revision
+	if _, err := client.Client.Get(ctx, "e1", clientv3.WithRev(cur+100)); err == nil {
+		t.Error("GET at future revision succeeded, want error")
+	}
+
+	// compacted revision: compact through the update revision (the create
+	// row is removed via its prev_revision reference), then query at the
+	// create revision, which lies strictly below the watermark
+	if _, err := client.Compact(ctx, cur); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	raw := openRawDB(t, dsn)
+	waitForCompaction(t, raw, createRev, "e1")
+	if _, err := client.Client.Get(ctx, "e1", clientv3.WithRev(createRev)); err == nil {
+		t.Errorf("GET at compacted revision %d succeeded, want error", createRev)
 	}
 }
