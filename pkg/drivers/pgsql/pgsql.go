@@ -194,6 +194,7 @@ type currentStateDialect struct {
 	currentListSQL      *query.Named
 	currentListValSQL   *query.Named
 	currentCountSQL     *query.Named
+	currentCountAllSQL  *query.Named
 }
 
 func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
@@ -216,6 +217,7 @@ func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
 		currentListValSQL: query.New(fmt.Sprintf(currentListFmt,
 			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal, query.LimitToken), "$", true, "ListCurrentVal"),
 		currentCountSQL: query.New(fmt.Sprintf(currentCountFmt, generic.CurrentRevSQL), "$", true, "CountCurrent"),
+		currentCountAllSQL: query.New(fmt.Sprintf(currentCountAllFmt, generic.CurrentRevSQL), "$", true, "CountCurrentAll"),
 	}
 }
 
@@ -306,11 +308,20 @@ func nullInt64Str(v sql.NullInt64) string {
 }
 
 func (d *currentStateDialect) CountCurrent(ctx context.Context, key, end string) (int64, int64, error) {
-	metrics.CurrentStateReads.WithLabelValues("count").Inc()
 	var (
 		rev   sql.NullInt64
 		count int64
 	)
+	// All-key requests normalize to key="", end=""; the bounded count query
+	// would return 0 for that range (OPTIMIZATION_ROUND_9.md D2).
+	if key == "" && end == "" {
+		metrics.CurrentStateReads.WithLabelValues("count_all").Inc()
+		if err := d.Generic.QueryRowNamed(ctx, d.currentCountAllSQL).Scan(&rev, &count); err != nil {
+			return 0, 0, err
+		}
+		return rev.Int64, count, nil
+	}
+	metrics.CurrentStateReads.WithLabelValues("count").Inc()
 	if err := d.Generic.QueryRowNamed(ctx, d.currentCountSQL, key, end).Scan(&rev, &count); err != nil {
 		return 0, 0, err
 	}
