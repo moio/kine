@@ -480,11 +480,13 @@ func nativeReads() bool {
 }
 
 // openPgxPool creates the pgx-native connection pool used for read
-// queries. Pool sizing: MaxConns mirrors the stdlib pool's MaxOpen (or
-// MaxIdle when unlimited); MinConns is half of MaxIdle, keeping warm
-// connections on hand for read bursts while staying under the server's
-// max_connections when both pools are populated (writes always use the
-// stdlib pool, which keeps up to MaxIdle connections).
+// queries. Pool sizing: when the operator sets an explicit MaxOpen cap, both
+// pools derive from it so the combined client-connection count stays within
+// the server's max_connections budget (OPTIMIZATION_ROUND_9.md §3.2: with
+// MaxIdle=64 and MaxOpen unset, stdlib (64) plus native (64) could reach 128
+// against max_connections=100). MinConns is half of MaxConns, keeping warm
+// connections on hand for read bursts (writes always use the stdlib pool,
+// which keeps up to MaxIdle connections).
 func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig generic.ConnectionPoolConfig) (*pgxpool.Pool, error) {
 	maxIdle := connPoolConfig.MaxIdle
 	if maxIdle == 0 {
@@ -500,7 +502,10 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 	// ConnString round-trips TLS but not the custom dialer
 	poolCfg.ConnConfig.DialFunc = config.DialFunc
 	poolCfg.MaxConns = int32(maxIdle)
-	poolCfg.MinConns = int32(maxIdle / 2)
+	if connPoolConfig.MaxOpen > 0 {
+		poolCfg.MaxConns = int32(connPoolConfig.MaxOpen)
+	}
+	poolCfg.MinConns = int32(poolCfg.MaxConns / 2)
 	poolCfg.MaxConnLifetime = connPoolConfig.MaxLifetime
 	poolCfg.MaxConnIdleTime = connPoolConfig.MaxIdleTime
 
