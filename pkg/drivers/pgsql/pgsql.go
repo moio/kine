@@ -228,6 +228,22 @@ func currentStateReads() bool {
 	return v == "true" || v == "1" || v == "TRUE"
 }
 
+// currentStateTeardown reports whether the mirror trigger should be removed
+// when current-state reads are disabled (OPTIMIZATION_ROUND_9.md D4).
+func currentStateTeardown() bool {
+	v := os.Getenv("KINE_PGSQL_CURRENT_STATE_TEARDOWN")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// triggerInstalled reports whether the kine_current_maintain trigger exists.
+func triggerInstalled(db *sql.DB) bool {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'kine_current_maintain' AND NOT tgisinternal`).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
 // setupCurrentState creates the mirror schema and verifies that kine_current
 // agrees with the history log before any current read may use it
 // (OPTIMIZATION_ROUND_8.md B4). It runs at startup, before kine admits
@@ -488,6 +504,16 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		}
 		backend = newCurrentStateDialect(dialect)
 		logrus.Info("current-state table reads enabled (KINE_PGSQL_CURRENT_STATE): current GET/LIST/COUNT are served from kine_current; includeDeleted and revision-bounded reads remain on the history log")
+	} else if currentStateTeardown() && triggerInstalled(dialect.DB) {
+		// OPTIMIZATION_ROUND_9.md D4: with mirror reads disabled, an operator
+		// can request removal of the maintenance trigger so writes no longer
+		// pay for it. The mirror table itself is kept; re-enabling the flag
+		// re-creates the trigger and the startup check rebuilds the mirror
+		// from the log (which is authoritative) before any read uses it.
+		if _, err := dialect.DB.Exec(`DROP TRIGGER IF EXISTS kine_current_maintain ON kine`); err != nil {
+			return false, nil, fmt.Errorf("current-state trigger teardown: %w", err)
+		}
+		logrus.Info("current-state trigger removed (KINE_PGSQL_CURRENT_STATE_TEARDOWN); the kine_current table is retained and will be rebuilt if the flag is re-enabled")
 	}
 
 	dialect.Migrate(context.Background())

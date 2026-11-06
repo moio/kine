@@ -833,3 +833,53 @@ func TestPGT10RevisionErrors(t *testing.T) {
 		t.Errorf("GET at compacted revision %d succeeded, want error", createRev)
 	}
 }
+
+// TestPGT9TriggerTeardown covers sub-plan 9.0 T9 / decision D4: with mirror
+// reads disabled and KINE_PGSQL_CURRENT_STATE_TEARDOWN=true, the maintenance
+// trigger is removed so writes no longer pay for it; re-enabling the flag
+// re-creates the trigger and rebuild-verifies before reads are served.
+func TestPGT9TriggerTeardown(t *testing.T) {
+	dsn := pgTestDSN(t)
+	ctx := context.Background()
+
+	// phase 1: mirror reads ON, trigger installed
+	cl1, stop1 := startPostgresKineRawFlags(t, dsn, true)
+	if _, err := cl1.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("t1"), "=", 0)).Then(clientv3.OpPut("t1", "v1")).Commit(); err != nil {
+		stop1()
+		t.Fatalf("phase-1 write: %v", err)
+	}
+	stop1()
+
+	// phase 2: reads OFF + teardown -> trigger dropped
+	t.Setenv("KINE_PGSQL_CURRENT_STATE_TEARDOWN", "true")
+	cl2, stop2 := startPostgresKineRawFlags(t, dsn, false)
+	if _, err := cl2.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("t2"), "=", 0)).Then(clientv3.OpPut("t2", "v2")).Commit(); err != nil {
+		stop2()
+		t.Fatalf("phase-2 write: %v", err)
+	}
+	stop2()
+
+	raw := openRawDB(t, dsn)
+	var trig int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM pg_trigger WHERE tgname='kine_current_maintain' AND NOT tgisinternal`).Scan(&trig); err != nil || trig != 0 {
+		t.Fatalf("trigger should be gone after teardown: trig=%d err=%v", trig, err)
+	}
+	// mirror no longer tracks writes (t2 has no trigger-maintained row)
+	var n int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM kine_current WHERE name='t2'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("mirror should not have tracked t2 after teardown: n=%d err=%v", n, err)
+	}
+
+	// phase 3: re-enable — trigger re-created, mirror rebuilt from the log
+	cl3, stop3 := startPostgresKineRawFlags(t, dsn, true)
+	defer stop3()
+	for key, want := range map[string]string{"t1": "v1", "t2": "v2"} {
+		g, err := cl3.Client.Get(ctx, key)
+		if err != nil || len(g.Kvs) != 1 || string(g.Kvs[0].Value) != want {
+			t.Fatalf("re-enable GET %s: err=%v kvs=%v", key, err, g.Kvs)
+		}
+	}
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM pg_trigger WHERE tgname='kine_current_maintain' AND NOT tgisinternal`).Scan(&trig); err != nil || trig != 1 {
+		t.Fatalf("trigger should be reinstalled: trig=%d err=%v", trig, err)
+	}
+}
