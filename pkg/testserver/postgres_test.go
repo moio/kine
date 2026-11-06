@@ -13,6 +13,7 @@ package testserver
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"sync"
@@ -27,9 +28,64 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const testDSNEnv = "KINE_TEST_PG_DSN"
+
+// startPostgresKineRaw starts a kine endpoint and returns the client plus an
+// explicit stop function, for tests that need to control the process
+// lifecycle (restart tests). The caller must invoke stop exactly once.
+func startPostgresKineRaw(t *testing.T, dsn string) (*kubernetes.Client, func()) {
+	t.Helper()
+	if dsn == "" {
+		t.Skipf("%s not set; skipping PostgreSQL feature test", testDSNEnv)
+	}
+	logrus.SetLevel(logrus.ErrorLevel)
+	logrus.SetOutput(t.Output())
+
+	t.Setenv("KINE_PGSQL_NATIVE_READS", "true")
+	t.Setenv("KINE_PGSQL_CURRENT_STATE", "true")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+
+	config := app.Config(nil)
+	config.WaitGroup = wg
+	config.Listener = "unix://" + t.TempDir() + "/kine.sock"
+	config.NotifyInterval = 5 * time.Second
+	config.CompactInterval = 0
+	config.CompactMinRetain = 0
+	config.Endpoint = dsn
+
+	e, err := endpoint.Listen(ctx, config)
+	if err != nil {
+		cancel()
+		return nil, func() {}
+	}
+
+	tlsConfig, err := e.TLSConfig.ClientConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	client, err := kubernetes.New(clientv3.Config{
+		TLS:         tlsConfig,
+		Endpoints:   e.Endpoints,
+		DialTimeout: 10 * time.Second,
+		DialOptions: []grpc.DialOption{grpc.WithBlock()},
+		Logger:      zaptest.NewLogger(t, zaptest.Level(zapcore.ErrorLevel)).Named("kine-client"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, func() {
+		cancel()
+		wg.Wait()
+	}
+}
 
 // startPostgresKine starts a kine endpoint against the given PostgreSQL DSN
 // with the current-state mirror enabled, and returns a typed client whose
@@ -103,14 +159,134 @@ func pgTestDSN(t *testing.T) string {
 	return dsn
 }
 
-// restartClient closes the current client (but not the kine process) and
-// connects a fresh client to the same database. Used for restart tests:
-// the kine process itself stays up, so mirror re-verification happens
-// through a new driver instance below, not here. For a full process
-// restart, start a new endpoint against the same DSN.
-func restartClient(t *testing.T, dsn string) *kubernetes.Client {
+// openRawDB opens a direct database/sql connection to the test database for
+// mirror-content inspection. The pgx stdlib driver is registered by the pgsql
+// driver package.
+func openRawDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	return startPostgresKine(t, dsn)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("raw DB open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// TestPGT2DeleteCompactRestart covers decision D1: after compaction removes
+// a key's tombstone from the history log (PostgreSQL CompactSQL deletes even
+// latest-revision tombstones), the retained mirror tombstone must NOT be
+// treated as mirror corruption at startup. Before the D1 repair the startup
+// count check sees COUNT(DISTINCT name) history < COUNT(*) mirror and
+// destructively rebuilds the mirror from the log, losing the tombstone.
+func TestPGT2DeleteCompactRestart(t *testing.T) {
+	dsn := pgTestDSN(t)
+
+	client, stop := startPostgresKineRaw(t, dsn)
+	ctx := context.Background()
+
+	// seed two keys, delete one
+	r1, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("kA"), "=", 0)).
+		Then(clientv3.OpPut("kA", "va")).Commit()
+	if err != nil || !r1.Succeeded {
+		t.Fatalf("seed kA: err=%v succ=%v", err, r1 != nil && r1.Succeeded)
+	}
+	r2, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("kB"), "=", 0)).
+		Then(clientv3.OpPut("kB", "vb")).Commit()
+	if err != nil || !r2.Succeeded {
+		t.Fatalf("seed kB: err=%v succ=%v", err, r2 != nil && r2.Succeeded)
+	}
+	// delete kA via the supported CAS txn shape (plain Delete RPC is
+	// Unimplemented on kine)
+	gk, err := client.Client.Get(ctx, "kA")
+	if err != nil || len(gk.Kvs) != 1 {
+		t.Fatalf("get kA before delete: err=%v kvs=%v", err, gk.Kvs)
+	}
+	dr, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("kA"), "=", gk.Kvs[0].ModRevision)).
+		Then(clientv3.OpDelete("kA")).Else(clientv3.OpGet("kA")).Commit()
+	if err != nil || !dr.Succeeded {
+		t.Fatalf("delete kA: err=%v succ=%v", err, dr != nil && dr.Succeeded)
+	}
+	var deletedCount int64
+	for _, resp := range dr.Responses {
+		if d := resp.GetResponseDeleteRange(); d != nil {
+			deletedCount += d.Deleted
+		}
+	}
+	if deletedCount != 1 {
+		t.Fatalf("delete kA: deleted=%d", deletedCount)
+	}
+	compactRev := dr.Header.Revision
+
+	// compact everything up to and including the tombstone
+	_, err = client.Compact(ctx, compactRev)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	// wait for physical compaction to remove the log rows <= compactRev
+	raw := openRawDB(t, dsn)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := raw.QueryRow(`SELECT COUNT(*) FROM kine WHERE id <= $1 AND name = 'kA'`, compactRev).Scan(&n); err != nil {
+			t.Fatalf("compaction poll: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log rows for kA not compacted within 10s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// a fresh write keeps MAX(id) equal on log and mirror while the count
+	// check disagrees (kA's tombstone survives only in the mirror)
+	r3, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("kC"), "=", 0)).
+		Then(clientv3.OpPut("kC", "vc")).Commit()
+	if err != nil || !r3.Succeeded {
+		t.Fatalf("seed kC: err=%v succ=%v", err, r3 != nil && r3.Succeeded)
+	}
+	stop()
+
+	// restart: setupCurrentState runs the sync check
+	client2, stop2 := startPostgresKineRaw(t, dsn)
+	defer stop2()
+
+	// D1: the retained tombstone must survive the restart
+	var tomb int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM kine_current WHERE name = 'kA' AND deleted = 1`).Scan(&tomb); err != nil {
+		t.Fatalf("tombstone check: %v", err)
+	}
+	if tomb != 1 {
+		t.Errorf("D1 BUG: mirror tombstone for kA lost across restart (count=%d) — destructive rebuild ran", tomb)
+	}
+
+	// public semantics after restart
+	g, err := client2.Client.Get(ctx, "kA")
+	if err != nil || len(g.Kvs) != 0 {
+		t.Fatalf("GET deleted kA after restart: err=%v kvs=%v", err, g.Kvs)
+	}
+	// delete-of-deleted via the supported get+delete txn shape (Then-only
+	// with Get+Delete on one key) must report deleted=false
+	tr, err := client2.Client.Txn(ctx).Then(clientv3.OpGet("kA"), clientv3.OpDelete("kA")).Commit()
+	if err != nil {
+		t.Fatalf("delete-of-deleted txn: %v", err)
+	}
+	var delDeleted int64
+	if len(tr.Responses) >= 2 {
+		if d := tr.Responses[1].GetResponseDeleteRange(); d != nil {
+			delDeleted = d.Deleted
+		}
+	}
+	if delDeleted != 0 {
+		t.Errorf("delete-of-deleted reported deleted=%d, want 0 (etcd semantics)", delDeleted)
+	}
+	// recreate works
+	rr, err := client2.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("kA"), "=", 0)).
+		Then(clientv3.OpPut("kA", "va2")).Commit()
+	if err != nil || !rr.Succeeded {
+		t.Fatalf("recreate kA after restart: err=%v succ=%v", err, rr != nil && rr.Succeeded)
+	}
 }
 
 // TestPGT1BasicSemantics covers create/update/failed-CAS/delete/recreate,

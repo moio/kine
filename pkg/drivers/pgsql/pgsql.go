@@ -260,13 +260,23 @@ func setupCurrentState(db *sql.DB) error {
 
 	if !needsRebuild && maxHist.Valid && maxHist.Int64 > 0 {
 		// max(id) equality is necessary but not sufficient: require exactly
-		// one mirror row per distinct history key (catches intermediate
-		// drift from, e.g., a writer that ran without the trigger).
-		var curCount, histKeys int64
-		if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM kine_current), (SELECT COUNT(DISTINCT name) FROM kine)`).Scan(&curCount, &histKeys); err != nil {
+		// one live mirror row per distinct live history key (catches
+		// intermediate drift from, e.g., a writer that ran without the
+		// trigger). Tombstones are compared on the live side only: the
+		// PostgreSQL compaction statement deletes every tombstone in its
+		// window from the log, even when it is a key's latest revision, so
+		// after compaction the mirror legitimately holds tombstones that the
+		// log no longer contains (OPTIMIZATION_ROUND_9.md D1). Requiring
+		// equal total counts here would classify those retained tombstones
+		// as corruption and trigger a destructive log-only rebuild that
+		// loses them.
+		var curLive, histLive int64
+		if err := db.QueryRow(`SELECT
+			(SELECT COUNT(*) FROM kine_current WHERE deleted = 0),
+			(SELECT COUNT(*) FROM (SELECT DISTINCT ON (name) name, deleted FROM kine ORDER BY name, id DESC) latest WHERE deleted = 0)`).Scan(&curLive, &histLive); err != nil {
 			return fmt.Errorf("current-state bootstrap check: %w", err)
 		}
-		needsRebuild = curCount != histKeys
+		needsRebuild = curLive != histLive
 	}
 
 	if !needsRebuild {
