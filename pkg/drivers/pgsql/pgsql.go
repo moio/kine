@@ -177,6 +177,22 @@ var (
 	createDB = `CREATE DATABASE "%s";`
 )
 
+// currentStateFillfactor returns the optional mirror fillfactor (10-100)
+// from KINE_PGSQL_CURRENT_STATE_FILLFACTOR, or 0 when unset/invalid; 0 means
+// "leave the PostgreSQL default (100) in place".
+func currentStateFillfactor() int {
+	v := os.Getenv("KINE_PGSQL_CURRENT_STATE_FILLFACTOR")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 10 || n > 100 {
+		logrus.Warnf("ignoring invalid KINE_PGSQL_CURRENT_STATE_FILLFACTOR=%q (want integer 10-100)", v)
+		return 0
+	}
+	return n
+}
+
 // currentStateDialect serves current-state reads from the kine_current
 // mirror table while delegating everything else to the wrapped Generic.
 // The mirror queries are built by newCurrentStateDialect; the embedded
@@ -255,6 +271,20 @@ func setupCurrentState(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("current-state schema setup: %w", err)
 		}
+	}
+	if ff := currentStateFillfactor(); ff > 0 {
+		// Catalog-only (instant, even on a populated table): it applies to
+		// pages filled by future writes, so its benefit accrues while the
+		// mirror is being built or updated, not retroactively. Measured in
+		// OPTIMIZATION_ROUND_9_4.md: fillfactor 80 keeps trigger upserts
+		// in-page (HOT), limits mirror bloat and preserves wide-read
+		// throughput on repeatedly updated mirrors.
+		stmt := fmt.Sprintf(`ALTER TABLE kine_current SET (fillfactor = %d)`, ff)
+		logrus.Tracef("SETUP EXEC CURRENT STATE: %v", query.Strip(stmt))
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("current-state fillfactor setup: %w", err)
+		}
+		logrus.Infof("kine_current fillfactor set to %d (KINE_PGSQL_CURRENT_STATE_FILLFACTOR)", ff)
 	}
 
 	var (

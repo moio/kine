@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1028,5 +1029,62 @@ func startPostgresKineRawSnapshot(t *testing.T, dsn string) (*kubernetes.Client,
 	return client, func() {
 		cancel()
 		wg.Wait()
+	}
+}
+
+// TestPGT12MirrorFillfactor covers sub-plan 9.4: with
+// KINE_PGSQL_CURRENT_STATE_FILLFACTOR set, setupCurrentState applies a
+// catalog-only fillfactor to kine_current (works on fresh and pre-existing
+// tables, never blocks traffic); invalid values are ignored and the default
+// (no reloptions) is preserved when the variable is unset.
+func TestPGT12MirrorFillfactor(t *testing.T) {
+	dsn := pgTestDSN(t)
+	ctx := context.Background()
+
+	t.Setenv("KINE_PGSQL_CURRENT_STATE_FILLFACTOR", "80")
+	c := startPostgresKine(t, dsn)
+	if _, err := c.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("ff1"), "=", 0)).
+		Then(clientv3.OpPut("ff1", "v1")).Commit(); err != nil {
+		t.Fatalf("seed ff1: %v", err)
+	}
+	// an in-page update exercises the HOT path the fillfactor exists to keep
+	// (kine txns support the '=' compare shape only — F16/T-SNAP precedent)
+	cur, err := c.Client.Get(ctx, "ff1")
+	if err != nil || len(cur.Kvs) != 1 {
+		t.Fatalf("get ff1 pre-update: %v", err)
+	}
+	if _, err := c.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("ff1"), "=", cur.Kvs[0].ModRevision)).
+		Then(clientv3.OpPut("ff1", "v2")).Else(clientv3.OpGet("ff1")).Commit(); err != nil {
+		t.Fatalf("update ff1: %v", err)
+	}
+	if g, err := c.Client.Get(ctx, "ff1"); err != nil || string(g.Kvs[0].Value) != "v2" {
+		t.Fatalf("get ff1: err=%v kvs=%v", err, g.Kvs)
+	}
+	c.Client.Close()
+
+	raw := openRawDB(t, dsn)
+	var joined string
+	if err := raw.QueryRow(`SELECT COALESCE(reloptions::text, '') FROM pg_class WHERE relname='kine_current'`).Scan(&joined); err != nil {
+		t.Fatalf("read reloptions: %v", err)
+	}
+	if !strings.Contains(joined, "fillfactor=80") {
+		t.Fatalf("kine_current reloptions = %q, want fillfactor=80", joined)
+	}
+
+	// restart with an invalid value: startup must succeed and the setting
+	// must be left alone
+	t.Setenv("KINE_PGSQL_CURRENT_STATE_FILLFACTOR", "not-a-number")
+	c2, stop2 := startPostgresKineRawFlags(t, dsn, true)
+	defer stop2()
+	if _, err := c2.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("ff2"), "=", 0)).
+		Then(clientv3.OpPut("ff2", "v1")).Commit(); err != nil {
+		t.Fatalf("write after invalid-fillfactor restart: %v", err)
+	}
+	var still string
+	if err := raw.QueryRow(`SELECT reloptions::text FROM pg_class WHERE relname='kine_current'`).Scan(&still); err != nil {
+		t.Fatalf("re-read reloptions: %v", err)
+	}
+	if !strings.Contains(still, "fillfactor=80") {
+		t.Fatalf("invalid fillfactor value altered reloptions: %q", still)
 	}
 }
