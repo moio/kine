@@ -409,6 +409,18 @@ func (d *currentStateDialect) ListCurrent(ctx context.Context, key, end string, 
 }
 
 func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
+	// OPTIMIZATION_ROUND_9.md §R9-3 M-Range: opt-in frozen diagnostic snapshot.
+	// Loads the mirror into memory at startup and serves current reads with no
+	// SQL in the measured path; all mutations fail closed. Reachable only via
+	// the explicit KINE_SNAPSHOT_LOAD_DSN environment variable.
+	if dsn := os.Getenv(snapshotEnvDSN); dsn != "" {
+		snap, err := loadSnapshot(ctx, dsn, cfg.BackendTLSConfig)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, logstructured.New(sqllog.New(snap, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+	}
+
 	config, err := prepareConfig(cfg.DataSourceName, cfg.BackendTLSConfig)
 	if err != nil {
 		return false, nil, err

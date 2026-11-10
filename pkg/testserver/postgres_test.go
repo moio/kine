@@ -883,3 +883,150 @@ func TestPGT9TriggerTeardown(t *testing.T) {
 		t.Fatalf("trigger should be reinstalled: trig=%d err=%v", trig, err)
 	}
 }
+
+// TestPGT11FrozenSnapshot covers sub-plan 9.3 T-SNAP: with
+// KINE_SNAPSHOT_LOAD_DSN set, the pgsql driver serves current reads from an
+// in-memory frozen snapshot through the ordinary endpoint path; writes fail
+// closed; revision-bounded reads return the declared unsupported error.
+func TestPGT11FrozenSnapshot(t *testing.T) {
+	dsn := pgTestDSN(t)
+	ctx := context.Background()
+
+	// phase 1: ordinary mirror endpoint, seed a small multi-revision state
+	c := startPostgresKine(t, dsn)
+	for _, kv := range []struct{ k, v string }{
+		{"aaa/1", "v1-1"}, {"aaa/2", "v2-1"}, {"bbb/1", "v3-1"},
+	} {
+		if _, err := c.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(kv.k), "=", 0)).
+			Then(clientv3.OpPut(kv.k, kv.v)).Commit(); err != nil {
+			t.Fatalf("seed %s: %v", kv.k, err)
+		}
+	}
+	// CAS update using the supported compare+put+get shape (F16)
+	createRev, err := c.Client.Get(ctx, "aaa/1")
+	if err != nil || len(createRev.Kvs) != 1 {
+		t.Fatalf("get aaa/1 pre-update: %v", err)
+	}
+	up, err := c.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("aaa/1"), "=", createRev.Kvs[0].ModRevision)).
+		Then(clientv3.OpPut("aaa/1", "v1-2")).Else(clientv3.OpGet("aaa/1")).Commit()
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	curRev := up.Header.Revision
+	// record the C-mode answers before freezing
+	rAll, err := c.Client.Get(ctx, "aaa/", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatalf("range: %v", err)
+	}
+	if len(rAll.Kvs) != 2 {
+		t.Fatalf("expected 2 live keys under aaa/, got %d", len(rAll.Kvs))
+	}
+	stopC := func() {}
+	_ = stopC
+	// stop the endpoint (cancel context via cleanup ordering is not enough:
+	// we need the same DSN reused below, which is fine for concurrent DBs,
+	// but a frozen snapshot must not see writes; stop now)
+	c.Client.Close()
+
+	// phase 2: restart on the same DB in frozen-snapshot mode
+	c2, stop2 := startPostgresKineRawSnapshot(t, dsn)
+	defer stop2()
+
+	// header revision parity
+	r, err := c2.Client.Get(ctx, "aaa/", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatalf("snapshot range: %v", err)
+	}
+	if r.Header.Revision != curRev {
+		t.Errorf("snapshot header revision = %d, want %d", r.Header.Revision, curRev)
+	}
+	if len(r.Kvs) != len(rAll.Kvs) {
+		t.Fatalf("snapshot returned %d kvs, want %d", len(r.Kvs), len(rAll.Kvs))
+	}
+	for i, kv := range r.Kvs {
+		want := rAll.Kvs[i]
+		if string(kv.Key) != string(want.Key) || string(kv.Value) != string(want.Value) ||
+			kv.ModRevision != want.ModRevision || kv.CreateRevision != want.CreateRevision ||
+			kv.Version != want.Version {
+			t.Errorf("kv %d mismatch: got key=%s modrev=%d val=%q, want key=%s modrev=%d val=%q",
+				i, kv.Key, kv.ModRevision, kv.Value, want.Key, want.ModRevision, want.Value)
+		}
+	}
+
+	// single-key get parity (updated value)
+	r1, err := c2.Client.Get(ctx, "aaa/1")
+	if err != nil || len(r1.Kvs) != 1 || string(r1.Kvs[0].Value) != "v1-2" {
+		t.Errorf("snapshot get aaa/1 = %v (err %v), want v1-2", r1.Kvs, err)
+	}
+
+	// count-only parity
+	rc, err := c2.Client.Get(ctx, "aaa/", clientv3.WithPrefix(), clientv3.WithCountOnly())
+	if err != nil || rc.Count != 2 {
+		t.Errorf("snapshot count-only = %d (err %v), want 2", rc.Count, err)
+	}
+
+	// writes fail closed
+	if _, err := c2.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("zzz"), "=", 0)).
+		Then(clientv3.OpPut("zzz", "v")).Commit(); err == nil {
+		t.Error("write against frozen snapshot succeeded, want fail-closed error")
+	}
+
+	// revision-bounded read below current: declared unsupported (or
+	// ErrCompacted if strictly below the compact watermark)
+	if _, err := c2.Client.Get(ctx, "aaa/1", clientv3.WithRev(1)); err == nil {
+		t.Error("revision-bounded GET against frozen snapshot succeeded, want declared error")
+	}
+}
+
+// startPostgresKineRawSnapshot starts kine with the frozen diagnostic
+// snapshot dialect against an already-seeded database.
+func startPostgresKineRawSnapshot(t *testing.T, dsn string) (*kubernetes.Client, func()) {
+	t.Helper()
+	if dsn == "" {
+		t.Skipf("%s not set; skipping PostgreSQL feature test", testDSNEnv)
+	}
+	logrus.SetLevel(logrus.ErrorLevel)
+	logrus.SetOutput(t.Output())
+
+	t.Setenv("KINE_PGSQL_NATIVE_READS", "true")
+	t.Setenv("KINE_PGSQL_CURRENT_STATE", "false")
+	t.Setenv("KINE_SNAPSHOT_LOAD_DSN", dsn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+
+	config := app.Config(nil)
+	config.WaitGroup = wg
+	config.Listener = "unix://" + t.TempDir() + "/kine.sock"
+	config.NotifyInterval = 5 * time.Second
+	config.CompactInterval = 0
+	config.CompactMinRetain = 0
+	config.Endpoint = dsn
+
+	e, err := endpoint.Listen(ctx, config)
+	if err != nil {
+		t.Fatalf("failed to start frozen-snapshot endpoint: %v", err)
+	}
+
+	tlsConfig, err := e.TLSConfig.ClientConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	client, err := kubernetes.New(clientv3.Config{
+		TLS:         tlsConfig,
+		Endpoints:   e.Endpoints,
+		DialTimeout: 10 * time.Second,
+		DialOptions: []grpc.DialOption{grpc.WithBlock()},
+		Logger:      zaptest.NewLogger(t, zaptest.Level(zapcore.ErrorLevel)).Named("kine-client"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, func() {
+		cancel()
+		wg.Wait()
+	}
+}
