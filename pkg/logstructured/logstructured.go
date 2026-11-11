@@ -122,7 +122,14 @@ func (l *LogStructured) Delete(ctx context.Context, key string, revision int64) 
 	}
 
 	if event == nil {
-		return rev, nil, true, nil
+		// The key has no history rows: it never existed, or its entire
+		// history (including the latest tombstone) was compacted away.
+		// etcd evaluates a ModRevision compare against unknown or compacted
+		// history as false, so the compare-and-delete fails and nothing is
+		// written. Returning deleted=true here made a stale-rev txn delete
+		// of an already-deleted, compacted key report success where etcd
+		// reports deleted=false.
+		return rev, nil, false, nil
 	}
 
 	if event.Delete {
