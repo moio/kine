@@ -237,7 +237,7 @@ func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
 			generic.CurrentRevSQL, generic.Columns, query.LimitToken), "$", true, "ListCurrent"),
 		currentListValSQL: query.New(fmt.Sprintf(currentListFmt,
 			generic.CurrentRevSQL, generic.WithVal, query.LimitToken), "$", true, "ListCurrentVal"),
-		currentCountSQL: query.New(fmt.Sprintf(currentCountFmt, generic.CurrentRevSQL), "$", true, "CountCurrent"),
+		currentCountSQL:    query.New(fmt.Sprintf(currentCountFmt, generic.CurrentRevSQL), "$", true, "CountCurrent"),
 		currentCountAllSQL: query.New(fmt.Sprintf(currentCountAllFmt, generic.CurrentRevSQL), "$", true, "CountCurrentAll"),
 	}
 }
@@ -581,6 +581,28 @@ func nativeReads() bool {
 // against max_connections=100). MinConns is half of MaxConns, keeping warm
 // connections on hand for read bursts (writes always use the stdlib pool,
 // which keeps up to MaxIdle connections).
+// validMemorySize reports whether s is a plain PostgreSQL memory amount:
+// digits with an optional unit (KB, MB, GB, TB; unitless means kB). Used to
+// keep env-provided values safe to embed in a SET statement.
+func validMemorySize(s string) bool {
+	body := s
+	for _, unit := range []string{"KB", "MB", "GB", "TB"} {
+		if strings.HasSuffix(s, unit) {
+			body = strings.TrimSuffix(s, unit)
+			break
+		}
+	}
+	if body == "" {
+		return false
+	}
+	for _, r := range body {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig generic.ConnectionPoolConfig) (*pgxpool.Pool, error) {
 	maxIdle := connPoolConfig.MaxIdle
 	if maxIdle == 0 {
@@ -603,6 +625,10 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 	poolCfg.MaxConnLifetime = connPoolConfig.MaxLifetime
 	poolCfg.MaxConnIdleTime = connPoolConfig.MaxIdleTime
 
+	// Session-scoped GUCs applied to every connection of the read pool.
+	// Combined into a single AfterConnect so multiple options compose.
+	var sessionSets []string
+
 	// OPTIMIZATION_ROUND_6.md R6-2: optional per-session cap on parallel
 	// query workers. The R5 history matrix showed the planner flipping the
 	// wide ListCurrentVal query to a parallel Gather Merge at low history
@@ -618,9 +644,35 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 		if err != nil || n < 0 {
 			return nil, fmt.Errorf("KINE_PGSQL_MAX_PARALLEL_WORKERS_PER_GATHER must be a non-negative integer, got %q", v)
 		}
+		sessionSets = append(sessionSets, "SET max_parallel_workers_per_gather = "+strconv.Itoa(n))
+	}
+
+	// OPTIMIZATION_ROUND_10_3.md L2: optional per-session work_mem for the
+	// read pool. The current-state list query sorts its result rows before
+	// returning (the mirror heap is not name-correlated, so the planner
+	// rightly prefers a bitmap scan + sort over an index-ordered scan);
+	// with the default 4 MB work_mem a 5000-key result (roughly 1.1 kB per
+	// row) spills to an external merge on disk on EVERY execution.
+	// Operators serving wide ranges can raise the read pool's work_mem to
+	// keep those sorts in memory (measured: wide/5000 +13% at 32 MB, small
+	// reads unaffected). Default is unset (PostgreSQL's own default), so
+	// behavior is unchanged unless the operator opts in.
+	if v := os.Getenv("KINE_PGSQL_WORK_MEM"); v != "" {
+		if !validMemorySize(v) {
+			return nil, fmt.Errorf("KINE_PGSQL_WORK_MEM must be a valid PostgreSQL memory size (e.g. 64MB), got %q", v)
+		}
+		sessionSets = append(sessionSets, "SET work_mem = '"+v+"'")
+	}
+
+	if len(sessionSets) > 0 {
+		sets := sessionSets
 		poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			_, err := conn.Exec(ctx, "SET max_parallel_workers_per_gather = "+strconv.Itoa(n))
-			return err
+			for _, s := range sets {
+				if _, err := conn.Exec(ctx, s); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 	}
 
