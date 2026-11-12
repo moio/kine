@@ -91,13 +91,18 @@ var (
 	// Tombstone-inclusive single-key existence checks (Create/Delete) are
 	// served from the mirror itself (see currentGetDelFmt); includeDeleted
 	// range reads remain on the history log by the dialect wrapper below.
+	// The compact_rev subquery is omitted from these queries: it is only
+	// consumed on history reads (revision > 0, ErrCompacted check), and
+	// every caller of these current-state queries passes revision == 0. A
+	// literal 0 keeps the scan contract (column 1 = compact_rev) without
+	// paying a subquery per read.
 	currentAllFmt = `
-		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		SELECT (%s) AS current_rev, 0 AS compact_rev, %s
 		FROM kine_current
 		WHERE deleted = 0
 		ORDER BY name ASC`
 	currentGetFmt = `
-		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		SELECT (%s) AS current_rev, 0 AS compact_rev, %s
 		FROM kine_current
 		WHERE name = ? AND deleted = 0`
 	// Tombstone-inclusive single-key variants: the mirror always holds the
@@ -112,11 +117,11 @@ var (
 	// deleted key reports deleted=false, matching etcd, instead of the
 	// post-compaction history answer deleted=true.
 	currentGetDelFmt = `
-		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		SELECT (%s) AS current_rev, 0 AS compact_rev, %s
 		FROM kine_current
 		WHERE name = ?`
 	currentListFmt = `
-		SELECT (%s) AS current_rev, (%s) AS compact_rev, %s
+		SELECT (%s) AS current_rev, 0 AS compact_rev, %s
 		FROM kine_current
 		WHERE name >= ? AND name < ? AND deleted = 0
 		ORDER BY name ASC %s`
@@ -217,21 +222,21 @@ func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
 	return &currentStateDialect{
 		Generic: dialect,
 		currentAllSQL: query.New(fmt.Sprintf(currentAllFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "AllCurrent"),
+			generic.CurrentRevSQL, generic.Columns), "$", true, "AllCurrent"),
 		currentAllValSQL: query.New(fmt.Sprintf(currentAllFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "AllCurrentVal"),
+			generic.CurrentRevSQL, generic.WithVal), "$", true, "AllCurrentVal"),
 		currentGetSQL: query.New(fmt.Sprintf(currentGetFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "GetSingle"),
+			generic.CurrentRevSQL, generic.Columns), "$", true, "GetSingle"),
 		currentGetValSQL: query.New(fmt.Sprintf(currentGetFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "GetSingleVal"),
+			generic.CurrentRevSQL, generic.WithVal), "$", true, "GetSingleVal"),
 		currentGetDelSQL: query.New(fmt.Sprintf(currentGetDelFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns), "$", true, "GetSingleDel"),
+			generic.CurrentRevSQL, generic.Columns), "$", true, "GetSingleDel"),
 		currentGetDelValSQL: query.New(fmt.Sprintf(currentGetDelFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal), "$", true, "GetSingleDelVal"),
+			generic.CurrentRevSQL, generic.WithVal), "$", true, "GetSingleDelVal"),
 		currentListSQL: query.New(fmt.Sprintf(currentListFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.Columns, query.LimitToken), "$", true, "ListCurrent"),
+			generic.CurrentRevSQL, generic.Columns, query.LimitToken), "$", true, "ListCurrent"),
 		currentListValSQL: query.New(fmt.Sprintf(currentListFmt,
-			generic.CurrentRevSQL, generic.CompactRevSQL, generic.WithVal, query.LimitToken), "$", true, "ListCurrentVal"),
+			generic.CurrentRevSQL, generic.WithVal, query.LimitToken), "$", true, "ListCurrentVal"),
 		currentCountSQL: query.New(fmt.Sprintf(currentCountFmt, generic.CurrentRevSQL), "$", true, "CountCurrent"),
 		currentCountAllSQL: query.New(fmt.Sprintf(currentCountAllFmt, generic.CurrentRevSQL), "$", true, "CountCurrentAll"),
 	}
