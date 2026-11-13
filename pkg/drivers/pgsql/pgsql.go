@@ -664,6 +664,28 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 		sessionSets = append(sessionSets, "SET work_mem = '"+v+"'")
 	}
 
+	// OPTIMIZATION_ROUND_11_A1.md: optional per-session plan_cache_mode for
+	// the read pool. pgx prepares every statement once per connection, and
+	// under PostgreSQL's default (auto) the plan cache compares the generic
+	// plan's estimated cost with the running average of custom plans. For
+	// the range-read statements the generic estimate uses the default range
+	// selectivity (hundreds of rows), so for small spans (1-100 keys) the
+	// custom plan always looks cheaper and the statement is re-planned on
+	// every execution, which costs more PG CPU than executing it. Whether a
+	// connection has flipped to the generic plan also depends on which
+	// ranges it served earlier, so small-range throughput varies with the
+	// workload history. force_generic_plan plans each statement once per
+	// connection. Default is unset (PostgreSQL's own default), so behavior
+	// is unchanged unless the operator opts in.
+	if v := os.Getenv("KINE_PGSQL_PLAN_CACHE_MODE"); v != "" {
+		switch v {
+		case "auto", "force_generic_plan", "force_custom_plan":
+		default:
+			return nil, fmt.Errorf("KINE_PGSQL_PLAN_CACHE_MODE must be one of auto, force_generic_plan, force_custom_plan, got %q", v)
+		}
+		sessionSets = append(sessionSets, "SET plan_cache_mode = "+v)
+	}
+
 	if len(sessionSets) > 0 {
 		sets := sessionSets
 		poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
