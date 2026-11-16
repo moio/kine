@@ -686,6 +686,39 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 		sessionSets = append(sessionSets, "SET plan_cache_mode = "+v)
 	}
 
+	// OPTIMIZATION_ROUND_11_A3.md: optional per-session enable_bitmapscan for
+	// the read pool. PostgreSQL's plan cache picks plan shapes without seeing
+	// the statement's actual range bounds: the generic plan for the
+	// current-state list query is estimated from the default range
+	// selectivity (a few hundred rows), for which a bitmap scan + top-N sort
+	// looks cheaper than the primary-key index scan. When the real range is
+	// much larger (e.g. a whole kube-apiserver resource prefix), the cached
+	// bitmap plan reads and sorts EVERY row in the range to answer a LIMITed
+	// page (measured 28x slower at LIMIT 5001 on a 100k-key span); under the
+	// default plan_cache_mode=auto the same flip happens on its own once the
+	// custom plan's average cost exceeds the generic estimate. With
+	// enable_bitmapscan=off every generic plan for these statements becomes
+	// an index scan that stops early at the LIMIT, and the flip decision
+	// itself stays on the custom plan for small pages. On every reachable
+	// statement class screened (point, span, paginated list, full mirror
+	// walk, pinned history lists, watch tail, single-key watch catchup,
+	// revision counts) the index-shaped plans measured equal or faster than
+	// the bitmap ones on a cache-resident mirror; the one exception (the
+	// range watch-catchup statement, unreachable: kine watches always call
+	// After with empty key bounds) regressed under force_generic_plan
+	// already without this knob. Default is unset (PostgreSQL's own
+	// default), so behavior is unchanged unless the operator opts in.
+	if v := os.Getenv("KINE_PGSQL_ENABLE_BITMAPSCAN"); v != "" {
+		switch v {
+		case "true", "1":
+			sessionSets = append(sessionSets, "SET enable_bitmapscan = on")
+		case "false", "0":
+			sessionSets = append(sessionSets, "SET enable_bitmapscan = off")
+		default:
+			return nil, fmt.Errorf("KINE_PGSQL_ENABLE_BITMAPSCAN must be a boolean (true/false), got %q", v)
+		}
+	}
+
 	if len(sessionSets) > 0 {
 		sets := sessionSets
 		poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
