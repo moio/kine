@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -585,22 +586,30 @@ func nativeReads() bool {
 // digits with an optional unit (KB, MB, GB, TB; unitless means kB). Used to
 // keep env-provided values safe to embed in a SET statement.
 func validMemorySize(s string) bool {
+	_, err := parseMemorySize(s)
+	return err == nil
+}
+
+// parseMemorySize parses a non-negative PostgreSQL-style memory size
+// (digits with optional KB/MB/GB/TB suffix) into bytes.
+func parseMemorySize(s string) (int64, error) {
 	body := s
-	for _, unit := range []string{"KB", "MB", "GB", "TB"} {
-		if strings.HasSuffix(s, unit) {
-			body = strings.TrimSuffix(s, unit)
+	unit := int64(1)
+	for _, u := range []string{"KB", "MB", "GB", "TB"} {
+		if strings.HasSuffix(s, u) {
+			body = strings.TrimSuffix(s, u)
+			unit = 1 << (10 * (strings.Index("KB MB GB TB", u)/3 + 1))
 			break
 		}
 	}
 	if body == "" {
-		return false
+		return 0, fmt.Errorf("invalid memory size %q", s)
 	}
-	for _, r := range body {
-		if r < '0' || r > '9' {
-			return false
-		}
+	n, err := strconv.ParseInt(body, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid memory size %q", s)
 	}
-	return true
+	return n * unit, nil
 }
 
 func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig generic.ConnectionPoolConfig) (*pgxpool.Pool, error) {
@@ -617,6 +626,43 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 	}
 	// ConnString round-trips TLS but not the custom dialer
 	poolCfg.ConnConfig.DialFunc = config.DialFunc
+
+	// OPTIMIZATION_ROUND_11_C3.md: optional large read buffer for the read
+	// pool's PostgreSQL connections. pgconn's receive path reads the socket
+	// in 8 KiB syscalls (pgproto3's chunk reader defaults to an 8 KiB
+	// buffer, and the background prefetch reader used on slow writes reads
+	// fixed 8 KiB chunks; neither layer exposes a buffer-size option, so a
+	// custom BuildFrontend cannot raise it). A wide response (~113 kB for a
+	// 100-key list, ~5.6 MB for a 5000-key list) then costs ~14 to ~700
+	// read() syscalls per response. Wrapping the dialed connection in a
+	// mutex-protected buffered reader (buffer filled with one large socket
+	// read, callers still receive their requested slice sizes) collapses
+	// those to ~1 syscall per buffer of response. This sits transparently
+	// underneath TLS, and is safe for pgconn's concurrent readers because
+	// both read through the same wrapper (see bufferedConn). Default is
+	// unset (no wrapping), so behavior is unchanged unless the operator
+	// opts in.
+	if v := os.Getenv("KINE_PGSQL_READ_BUFFER"); v != "" {
+		size, err := parseMemorySize(v)
+		if err != nil {
+			return nil, fmt.Errorf("KINE_PGSQL_READ_BUFFER must be a valid PostgreSQL memory size (e.g. 1MB), got %q", v)
+		}
+		if size < 8192 || size > 128<<20 {
+			return nil, fmt.Errorf("KINE_PGSQL_READ_BUFFER must be between 8KB and 128MB, got %q", v)
+		}
+		base := config.DialFunc
+		if base == nil {
+			d := &net.Dialer{KeepAlive: 5 * time.Minute}
+			base = d.DialContext
+		}
+		poolCfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := base(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return newBufferedConn(c, int(size)), nil
+		}
+	}
 	poolCfg.MaxConns = int32(maxIdle)
 	if connPoolConfig.MaxOpen > 0 {
 		poolCfg.MaxConns = int32(connPoolConfig.MaxOpen)
