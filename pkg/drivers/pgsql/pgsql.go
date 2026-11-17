@@ -106,6 +106,14 @@ var (
 		SELECT (%s) AS current_rev, 0 AS compact_rev, %s
 		FROM kine_current
 		WHERE name = ? AND deleted = 0`
+	// Coalesced point-get variant (KINE_PGSQL_POINT_GET_BATCH): one query
+	// answers any number of single-key reads with the same snapshot. The
+	// name column stays in the projection (column 4) so rows can be routed
+	// back to their requesting member.
+	currentGetAnyFmt = `
+		SELECT (%s) AS current_rev, 0 AS compact_rev, %s
+		FROM kine_current
+		WHERE name = ANY(?) AND deleted = 0`
 	// Tombstone-inclusive single-key variants: the mirror always holds the
 	// latest committed row per key, tombstone or not, so these variants are
 	// authoritative for the includeDeleted existence checks in Create/Delete
@@ -217,6 +225,11 @@ type currentStateDialect struct {
 	currentListValSQL   *query.Named
 	currentCountSQL     *query.Named
 	currentCountAllSQL  *query.Named
+	currentGetAnyValSQL *query.Named
+	// pointBatch is non-nil when coalesced point reads are enabled
+	// (KINE_PGSQL_POINT_GET_BATCH); nil means every point read goes out
+	// unbatched.
+	pointBatch *pointGetBatcher
 }
 
 func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
@@ -240,6 +253,8 @@ func newCurrentStateDialect(dialect *generic.Generic) *currentStateDialect {
 			generic.CurrentRevSQL, generic.WithVal, query.LimitToken), "$", true, "ListCurrentVal"),
 		currentCountSQL:    query.New(fmt.Sprintf(currentCountFmt, generic.CurrentRevSQL), "$", true, "CountCurrent"),
 		currentCountAllSQL: query.New(fmt.Sprintf(currentCountAllFmt, generic.CurrentRevSQL), "$", true, "CountCurrentAll"),
+		currentGetAnyValSQL: query.New(fmt.Sprintf(currentGetAnyFmt,
+			generic.CurrentRevSQL, generic.WithVal), "$", true, "GetSingleValBatch"),
 	}
 }
 
@@ -255,6 +270,31 @@ func currentStateReads() bool {
 func currentStateTeardown() bool {
 	v := os.Getenv("KINE_PGSQL_CURRENT_STATE_TEARDOWN")
 	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// pointGetBatchEnabled reports whether coalesced current-state point reads
+// are enabled (B1, OPTIMIZATION_ROUND_11.md). Default off.
+func pointGetBatchEnabled() bool {
+	v := os.Getenv("KINE_PGSQL_POINT_GET_BATCH")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// pointGetBatchParams reads the optional batch tuning knobs.
+func pointGetBatchParams() (size, inflight int, err error) {
+	size, inflight = 64, 4
+	if v := os.Getenv("KINE_PGSQL_POINT_GET_BATCH_SIZE"); v != "" {
+		size, err = strconv.Atoi(v)
+		if err != nil || size < 1 || size > 1024 {
+			return 0, 0, fmt.Errorf("KINE_PGSQL_POINT_GET_BATCH_SIZE must be an integer in [1,1024], got %q", v)
+		}
+	}
+	if v := os.Getenv("KINE_PGSQL_POINT_GET_BATCH_INFLIGHT"); v != "" {
+		inflight, err = strconv.Atoi(v)
+		if err != nil || inflight < 1 || inflight > 16 {
+			return 0, 0, fmt.Errorf("KINE_PGSQL_POINT_GET_BATCH_INFLIGHT must be an integer in [1,16], got %q", v)
+		}
+	}
+	return size, inflight, nil
 }
 
 // triggerInstalled reports whether the kine_current_maintain trigger exists.
@@ -427,6 +467,10 @@ func (d *currentStateDialect) ListCurrent(ctx context.Context, key, end string, 
 	case end == "":
 		if keysOnly {
 			variant, sqlq = "get_keys_only", d.currentGetSQL
+		} else if d.pointBatch != nil {
+			// B1: coalesce concurrent current-state point gets into one
+			// name = ANY query; see batch.go for the semantics contract.
+			return d.pointBatch.get(ctx, key)
 		} else {
 			variant, sqlq = "get_value", d.currentGetValSQL
 		}
@@ -551,6 +595,24 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 			return false, nil, err
 		}
 		backend = newCurrentStateDialect(dialect)
+		// B1 (OPTIMIZATION_ROUND_11.md): opt-in coalesced current-state point
+		// reads. Requires the pgx-native read path — the merged query is a
+		// single pool.Query with an ANY($1) array arg, and results are routed
+		// as raw binary wire values to per-request memory row sets.
+		if csd, ok := backend.(*currentStateDialect); ok && pointGetBatchEnabled() {
+			if dialect.PgxPool == nil {
+				logrus.Warn("KINE_PGSQL_POINT_GET_BATCH ignored: requires KINE_PGSQL_NATIVE_READS=true")
+			} else {
+				size, inflight, err := pointGetBatchParams()
+				if err != nil {
+					return false, nil, err
+				}
+				csd.pointBatch = newPointGetBatcher(size, inflight, func(ctx context.Context, keys []string) ([][][]byte, error) {
+					return dialect.QueryRowsRaw(ctx, csd.currentGetAnyValSQL, keys)
+				})
+				logrus.Infof("coalesced current-state point reads enabled (KINE_PGSQL_POINT_GET_BATCH): batch size %d, in-flight %d", size, inflight)
+			}
+		}
 		logrus.Info("current-state table reads enabled (KINE_PGSQL_CURRENT_STATE): current GET/LIST/COUNT are served from kine_current; includeDeleted and revision-bounded reads remain on the history log")
 	} else if currentStateTeardown() && triggerInstalled(dialect.DB) {
 		// OPTIMIZATION_ROUND_9.md D4: with mirror reads disabled, an operator

@@ -355,6 +355,44 @@ func (r *sqlRowSet) Err() error             { return r.rows.Err() }
 func (r *sqlRowSet) RawValues() [][]byte    { return nil }
 func (r *sqlRowSet) Binary() bool           { return false }
 
+// QueryRowsRaw executes sql like query (binary result format, cached-rev
+// substitution) but drains the entire result and returns each row's raw
+// wire-format values with copies owned by the caller. Used by coalesced
+// multi-key point reads, where one query serves several requests and each
+// row must be routed to a different consumer.
+func (d *Generic) QueryRowsRaw(ctx context.Context, sql *query.Named, args ...any) ([][][]byte, error) {
+	q := d.substituteCachedRevs(sql.Name, sql.Query)
+	queryStr := sql.Fill(args)
+	startTime := time.Now()
+	if d.PgxPool == nil {
+		return nil, fmt.Errorf("QueryRowsRaw requires the pgx pool (KINE_PGSQL_NATIVE_READS)")
+	}
+	queryArgs := make([]any, 0, len(args)+1)
+	queryArgs = append(queryArgs, pgx.QueryResultFormats{pgx.BinaryFormatCode})
+	queryArgs = append(queryArgs, args...)
+	rows, err := d.PgxPool.Query(ctx, q, queryArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][][]byte
+	for rows.Next() {
+		raw := rows.RawValues()
+		cp := make([][]byte, len(raw))
+		for i, v := range raw {
+			cp[i] = make([]byte, len(v))
+			copy(cp[i], v)
+		}
+		out = append(out, cp)
+	}
+	if err := rows.Err(); err != nil {
+		metrics.ObserveSQL(startTime, d.ErrCode(err), 0, queryStr)
+		return nil, err
+	}
+	metrics.ObserveSQL(startTime, "", 0, queryStr)
+	return out, nil
+}
+
 // pgxRowSet adapts pgx.Rows to server.RowSet, exposing raw wire-format
 // values. The values alias pgx's connection read buffer and are only
 // valid until the next call to Next; consumers must copy immediately.
