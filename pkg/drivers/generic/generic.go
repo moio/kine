@@ -107,6 +107,13 @@ type Generic struct {
 	InsertSQL               *query.Named
 	FillSQL                 *query.Named
 	InsertLastInsertIDSQL   *query.Named
+	// InsertCASSQL, when non-nil, carries the fused check-and-append
+	// statement of OPTIMIZATION_ROUND_17.md; only drivers whose backend
+	// can arbitrate the CAS check inside one INSERT statement set it
+	// (PostgreSQL via the (name, prev_revision) unique index).
+	// FusedCAS is the operator opt-in switch (KINE_PGSQL_FUSED_CAS).
+	InsertCASSQL *query.Named
+	FusedCAS     bool
 	GetSizeSQL              *query.Named
 	Retry                   ErrRetry
 	InsertRetry             ErrRetry
@@ -862,6 +869,62 @@ func (d *Generic) Insert(ctx context.Context, key string, create, delete bool, c
 		}
 
 		return id, err
+	}
+	return
+}
+
+// FusedCASEnabled reports whether the fused check-and-append CAS fast path
+// is active: the dialect must ship the fused statement and the operator
+// must have opted in (KINE_PGSQL_FUSED_CAS).
+func (d *Generic) FusedCASEnabled() bool { return d.FusedCAS && d.InsertCASSQL != nil }
+
+// InsertCAS performs the fused CAS check-and-append (OPTIMIZATION_ROUND_17.md):
+// one INSERT...SELECT statement verifies that the key's latest row (MAX(id)
+// for the name) is a live row at the expected revision and appends the
+// successor, with the (name, prev_revision) unique index as the commit-time
+// arbiter. It returns the new revision and the row's create_revision
+// (the caller-visible CreateRevision of the updated key).
+//
+// Semantics deliberately mirror Insert + the pre-Append read:
+//   - no row returned: the check did not hold (key absent, tombstone latest
+//     or a newer row visible) → ok=false; the caller falls back to the
+//     ordinary read-then-append path, which provisions the failure KV.
+//   - unique violation on the arbiter index: the caller lost a race →
+//     ok=false (same as a violated Append, which re-reads and reports
+//     not-ok); kine_pkey violations stay retriable like Insert's.
+//
+// Concurrency: one statement, one READ COMMITTED snapshot; the unique index
+// arbitrates. Returning zero rows for a raced check is exact, not an error.
+func (d *Generic) InsertCAS(ctx context.Context, key string, expectedRevision, lease int64, value []byte) (id, createRevision int64, ok bool, err error) {
+	wait := strategy.Backoff(backoff.Linear(100 * time.Millisecond))
+	for i := uint(0); i < 20; i++ {
+		row := d.queryRow(ctx, d.InsertCASSQL, key, expectedRevision, value, lease)
+		err = row.Scan(&id, &createRevision)
+		if err == sql.ErrNoRows {
+			// the check did not hold; treat as a failed CAS
+			metrics.FusedCAS.WithLabelValues("no_match").Inc()
+			return 0, 0, false, nil
+		}
+		if err != nil && d.InsertRetry != nil && d.InsertRetry(err) {
+			// sequence raced a gap fill (kine_pkey); retry, as Insert does
+			logrus.Warnf("Retriable insert error for key %v: %v", key, err)
+			metrics.InsertErrorsTotal.WithLabelValues("true").Inc()
+			wait(i)
+			continue
+		}
+		if err != nil && d.TranslateErr != nil && errors.Is(d.TranslateErr(err), server.ErrKeyExists) {
+			// unique violation on the arbiter (or translated equivalent):
+			// the caller lost a race, same as a unique violation on Append
+			metrics.FusedCAS.WithLabelValues("conflict").Inc()
+			return 0, 0, false, nil
+		}
+		if err != nil {
+			metrics.InsertErrorsTotal.WithLabelValues("false").Inc()
+			logrus.WithField("key", key).WithField("expectedRevision", expectedRevision).Errorf("InsertCAS error for key %v: %v", key, err)
+			return 0, 0, false, err
+		}
+		metrics.FusedCAS.WithLabelValues("success").Inc()
+		return id, createRevision, true, nil
 	}
 	return
 }

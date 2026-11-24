@@ -812,17 +812,62 @@ func (s *SQLLog) Append(ctx context.Context, event *server.Event) (int64, error)
 		return 0, err
 	}
 
+	s.appended(currentRev, rev)
+	return rev, nil
+}
+
+// CASInserter is the opt-in write capability of OPTIMIZATION_ROUND_17.md:
+// one statement verifies the key's latest row is a live row at the expected
+// revision and appends the successor, arbitrated by the backend's unique
+// index. Only implemented by databases that can do both in a single
+// statement (PostgreSQL).
+type CASInserter interface {
+	FusedCASEnabled() bool
+	InsertCAS(ctx context.Context, key string, expectedRevision, lease int64, value []byte) (id, createRevision int64, ok bool, err error)
+}
+
+// CASFusable reports whether Update should attempt the fused CAS path.
+func (s *SQLLog) CASFusable() bool {
+	if ci, can := s.d.(CASInserter); can {
+		return ci.FusedCASEnabled()
+	}
+	return false
+}
+
+// UpdateCAS performs the fused check-and-append for a supported CAS update;
+// on success it returns the updated KV (ModRevision = new revision,
+// CreateRevision from the appended row). ok=false means the CAS check did
+// not hold or was lost in a race — the caller falls back to the original
+// read-then-append path, which reproduces the pre-fusion semantics exactly.
+func (s *SQLLog) UpdateCAS(ctx context.Context, key string, value []byte, expectedRevision, lease int64) (*server.KeyValue, bool, error) {
+	currentRev := s.currentRev.Load()
+	rev, createRevision, ok, err := s.d.(CASInserter).InsertCAS(ctx, key, expectedRevision, lease, value)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	s.appended(currentRev, rev)
+	return &server.KeyValue{
+		Key:            key,
+		Value:          value,
+		Lease:          lease,
+		ModRevision:    rev,
+		CreateRevision: createRevision,
+	}, true, nil
+}
+
+// appended publishes a completed append to the poller and advances the
+// cached current revision; shared by Append and UpdateCAS.
+func (s *SQLLog) appended(previousRevision, rev int64) {
 	// notify the polling loop of the new revision.
 	select {
 	case s.notify <- rev:
 	default:
 	}
 
-	// currentRev may have moved ahead due to other inserts between when Insert returned
-	// and now; ensure that we don't roll it back if it has changed elsewhere.
-	s.currentRev.CompareAndSwap(currentRev, rev)
-
-	return rev, nil
+	// previousRevision may have moved ahead due to other inserts between when
+	// the insert returned and now; ensure that we don't roll it back if it
+	// has changed elsewhere.
+	s.currentRev.CompareAndSwap(previousRevision, rev)
 }
 
 // wire-format column decoders. PostgreSQL binary encoding: int8 and

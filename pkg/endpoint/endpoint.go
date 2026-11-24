@@ -116,6 +116,7 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 			metrics.InsertErrorsTotal,
 			metrics.ScanMode,
 			metrics.CurrentStateReads,
+			metrics.FusedCAS,
 		)
 	}
 

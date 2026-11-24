@@ -24,6 +24,14 @@ type Log interface {
 	Compact(ctx context.Context, revision int64) (int64, error)
 }
 
+// CASUpdater is the optional fused check-and-append capability of
+// OPTIMIZATION_ROUND_17.md, implemented by logs over backends that can
+// arbitrate a CAS check inside one INSERT statement (PostgreSQL).
+type CASUpdater interface {
+	CASFusable() bool
+	UpdateCAS(ctx context.Context, key string, value []byte, expectedRevision, lease int64) (*server.KeyValue, bool, error)
+}
+
 type LogStructured struct {
 	log Log
 }
@@ -193,6 +201,22 @@ func (l *LogStructured) Update(ctx context.Context, key string, value []byte, re
 			logrus.Tracef("UPDATE %s, value=%d, rev=%d, lease=%v => rev=%d, kvrev=%d, updated=%v, err=%v", key, len(value), revision, lease, revRet, kvRev, updateRet, errRet)
 		}
 	}()
+
+	// OPTIMIZATION_ROUND_17.md: when the backing log supports the fused
+	// check-and-append, the CAS fast path collapses the pre-read and the
+	// append into one statement. A failed check falls through to the
+	// original read-then-append path below, which reproduces the original
+	// failure semantics (including the KV carried back) without a second
+	// copy of that logic.
+	if cu, canFuse := l.log.(CASUpdater); canFuse && cu.CASFusable() {
+		kv, updated, err := cu.UpdateCAS(ctx, key, value, revision, lease)
+		if err != nil {
+			return 0, nil, false, err
+		}
+		if updated {
+			return kv.ModRevision, kv, true, nil
+		}
+	}
 
 	rev, event, err := l.get(ctx, key, 0, false, false)
 	if err != nil {

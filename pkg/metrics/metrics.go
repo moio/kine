@@ -47,6 +47,11 @@ var (
 		Name: "kine_insert_errors_total",
 		Help: "Total number of insert retries due to unique constraint violations",
 	}, []string{"retriable"})
+
+	FusedCAS = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kine_fused_cas_total",
+		Help: "Fused CAS check-and-append outcomes (OPTIMIZATION_ROUND_17.md): success, conflict (arbiter unique violation), no_match (check did not hold)",
+	}, []string{"result"})
 )
 
 var (

@@ -182,6 +182,30 @@ var (
 		FOR EACH ROW EXECUTE FUNCTION kine_current_maintain();`,
 	}
 
+	// Fused CAS check-and-append (OPTIMIZATION_ROUND_17.md,
+	// KINE_PGSQL_FUSED_CAS): one statement verifies the key's latest row is a
+	// live row at the expected revision and appends the successor. The
+	// (name, prev_revision) unique index arbitrates racing writers: two
+	// statements that both accept the same expected revision propose the
+	// same (name, prev_revision) pair, so exactly one can commit. The
+	// checked subquery is the same MAX(id)-per-name shape the pre-append
+	// read uses (GetSingleVal), and old_value comes from the matched row,
+	// replacing Insert's old_value subselect. deleted=0 makes the appended
+	// row a live update and created=0 marks it as an update exactly like the
+	// Update path's event (e.Create=false); create_revision follows the
+	// row-chaining rule (create rows carry 0 in the column; the reader
+	// derives create_revision = id), matching what the UPDATE path read.
+	insertCASFmt = `
+		INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT $1, 0, 0,
+		       CASE WHEN cur.created = 1 THEN cur.id ELSE cur.create_revision END,
+		       cur.id, $4, $3, cur.value
+		FROM (SELECT id, created, deleted, create_revision, value
+		      FROM kine
+		      WHERE id = (SELECT MAX(id) FROM kine WHERE name = $1)) cur
+		WHERE cur.deleted = 0 AND cur.id = $2
+		RETURNING id, create_revision`
+
 	schemaMigrations = []string{
 		`ALTER TABLE kine ALTER COLUMN id SET DATA TYPE BIGINT, ALTER COLUMN create_revision SET DATA TYPE BIGINT, ALTER COLUMN prev_revision SET DATA TYPE BIGINT; ALTER SEQUENCE kine_id_seq AS BIGINT`,
 		// It is important to set the collation to "C" to ensure that LIKE and COMPARISON
@@ -589,6 +613,15 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		return false, nil, err
 	}
 
+	// Fused CAS check-and-append (OPTIMIZATION_ROUND_17.md): opt-in via
+	// KINE_PGSQL_FUSED_CAS. The statement arbitrates racing writers with the
+	// (name, prev_revision) unique index, which this schema always creates.
+	if fusedCASEnabled() {
+		dialect.InsertCASSQL = query.New(insertCASFmt, "$", true, "InsertCAS")
+		dialect.FusedCAS = true
+		logrus.Info("fused CAS check-and-append enabled (KINE_PGSQL_FUSED_CAS): supported CAS updates check and append in one statement")
+	}
+
 	backend := server.Dialect(dialect)
 	if currentStateReads() {
 		if err := setupCurrentState(dialect.DB); err != nil {
@@ -628,6 +661,13 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 
 	dialect.Migrate(context.Background())
 	return true, logstructured.New(sqllog.New(backend, cfg.CompactInterval, cfg.CompactIntervalJitter, cfg.CompactTimeout, cfg.CompactMinRetain, cfg.CompactBatchSize, cfg.PollBatchSize)), nil
+}
+
+// fusedCASEnabled reports whether the fused CAS check-and-append statement
+// replaces the read-then-insert CAS fast path (OPTIMIZATION_ROUND_17.md).
+func fusedCASEnabled() bool {
+	v := os.Getenv("KINE_PGSQL_FUSED_CAS")
+	return v == "true" || v == "1" || v == "TRUE"
 }
 
 // nativeReads reports whether the pgx-native read path is enabled.
