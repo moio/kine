@@ -124,6 +124,11 @@ type Generic struct {
 	// BarePutFast (which remains the fallback path).
 	OneStmtPut  bool
 	PutFast1SQL *query.Named
+	// InlineCurrentState reports that the mirror-maintain trigger has been
+	// dropped and the write statements carry the kine_current upsert
+	// themselves (KINE_PGSQL_INLINE_CURRENT_STATE, OPTIMIZATION_ROUND_20.md).
+	// Migrate needs this to maintain the mirror on its raw migration insert.
+	InlineCurrentState bool
 	GetSizeSQL            *query.Named
 	Retry                 ErrRetry
 	InsertRetry           ErrRetry
@@ -175,11 +180,25 @@ func (d *Generic) Migrate(ctx context.Context) {
 	}
 
 	logrus.Infof("Migrating content from old table")
-	_, err := d.execute(ctx,
-		query.New(`INSERT INTO kine(deleted, create_revision, prev_revision, name, value, created, lease)
+	// OPTIMIZATION_ROUND_20.md: when the mirror-maintain trigger is dropped
+	// (KINE_PGSQL_INLINE_CURRENT_STATE), migrated rows must reach the mirror
+	// too — the migration statement carries its own kine_current upsert.
+	migrateSQL := `INSERT INTO kine(deleted, create_revision, prev_revision, name, value, created, lease)
 					SELECT 0, 0, 0, kv.name, kv.value, 1, CASE WHEN kv.ttl > 0 THEN 15 ELSE 0 END
 					FROM key_value kv
-						WHERE kv.id IN (SELECT MAX(kvd.id) FROM key_value kvd GROUP BY kvd.name)`, "?", false, ""))
+						WHERE kv.id IN (SELECT MAX(kvd.id) FROM key_value kvd GROUP BY kvd.name)`
+	if d.InlineCurrentState {
+		migrateSQL = "WITH ins AS (\n" +
+			migrateSQL +
+			"\nRETURNING id, name, created, deleted, create_revision, prev_revision, lease, value\n)\n" +
+			"INSERT INTO kine_current AS cur (id, name, created, deleted, create_revision, prev_revision, lease, value)\n" +
+			"SELECT id, name, created, deleted, create_revision, prev_revision, lease, value FROM ins\n" +
+			"ON CONFLICT (name) DO UPDATE SET id = EXCLUDED.id, created = EXCLUDED.created, deleted = EXCLUDED.deleted,\n" +
+			"create_revision = EXCLUDED.create_revision, prev_revision = EXCLUDED.prev_revision, lease = EXCLUDED.lease, value = EXCLUDED.value\n" +
+			"WHERE cur.id < EXCLUDED.id"
+	}
+	_, err := d.execute(ctx,
+		query.New(migrateSQL, "?", false, ""))
 	if err != nil {
 		logrus.Errorf("Migration failed: %v", err)
 	}

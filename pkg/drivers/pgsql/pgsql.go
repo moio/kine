@@ -240,6 +240,72 @@ var (
 		RIGHT JOIN (VALUES (1)) AS keep ON true
 		RETURNING id, prev_revision, create_revision`
 
+	// Mirror-maintenance upsert as a statement fragment (OPTIMIZATION_ROUND_20.md,
+	// KINE_PGSQL_INLINE_CURRENT_STATE): with current state on, every history
+	// INSERT fires the AFTER INSERT trigger kine_current_maintain(); when the
+	// inline flag is on, the trigger is dropped and each write statement instead
+	// appends the mirror upsert as a data-modifying CTE. The %s takes the
+	// INSERT body, which must end with RETURNING exposing the new row's columns
+	// so the outer upsert can project them.
+	upsertCTE = `WITH ins AS (
+		%s
+	)
+	INSERT INTO kine_current AS cur (id, name, created, deleted, create_revision, prev_revision, lease, value)
+	SELECT id, name, created, deleted, create_revision, prev_revision, lease, value FROM ins
+	ON CONFLICT (name) DO UPDATE SET
+	  id = EXCLUDED.id, created = EXCLUDED.created, deleted = EXCLUDED.deleted,
+	  create_revision = EXCLUDED.create_revision, prev_revision = EXCLUDED.prev_revision,
+	  lease = EXCLUDED.lease, value = EXCLUDED.value
+	WHERE cur.id < EXCLUDED.id`
+
+	insertCTEBodyFmt = `
+		INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT ?, ?, ?, ?, ?, ?, ?, (SELECT value FROM kine WHERE id = ?)
+		RETURNING id, name, created, deleted, create_revision, prev_revision, lease, value`
+	insertInlineFmt = upsertCTE + `
+	RETURNING (SELECT id FROM ins) AS id`
+
+	insertCASCTEBodyFmt = `
+		INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT $1, 0, 0,
+		       CASE WHEN cur.created = 1 THEN cur.id ELSE cur.create_revision END,
+		       cur.id, $4, $3, cur.value
+		FROM (SELECT id, created, deleted, create_revision, value
+		      FROM kine
+		      WHERE id = (SELECT MAX(id) FROM kine WHERE name = $1)) cur
+		WHERE cur.deleted = 0 AND cur.id = $2
+		RETURNING id, create_revision, name, created, deleted, prev_revision, lease, value`
+	insertCASInlineFmt = upsertCTE + `
+	RETURNING (SELECT id FROM ins) AS id, (SELECT create_revision FROM ins) AS create_revision`
+
+	putFast1CTEBodyFmt = `
+		INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT $1,
+		       CASE WHEN cur.id IS NULL OR cur.deleted = 1 THEN 1 ELSE 0 END,
+		       0,
+		       CASE
+		         WHEN cur.id IS NULL OR cur.deleted = 1 THEN 0
+		         WHEN cur.created = 1 THEN cur.id
+		         ELSE cur.create_revision
+		       END,
+		       COALESCE(cur.id, 0),
+		       $3, $2,
+		       CASE WHEN cur.id IS NULL OR cur.deleted = 1 THEN NULL ELSE cur.value END
+		FROM (SELECT id, created, deleted, create_revision, value
+		      FROM kine
+		      WHERE id = (SELECT MAX(id) FROM kine WHERE name = $1)) cur
+		RIGHT JOIN (VALUES (1)) AS keep ON true
+		RETURNING id, prev_revision, create_revision, name, created, deleted, lease, value`
+	putFast1InlineFmt = upsertCTE + `
+	RETURNING (SELECT id FROM ins) AS id, (SELECT prev_revision FROM ins) AS prev_revision, (SELECT create_revision FROM ins) AS create_revision`
+
+	fillCTEBodyFmt = `
+		INSERT INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id, name, created, deleted, create_revision, prev_revision, lease, value`
+	fillInlineFmt = upsertCTE + `
+	RETURNING 1`
+
 	schemaMigrations = []string{
 		`ALTER TABLE kine ALTER COLUMN id SET DATA TYPE BIGINT, ALTER COLUMN create_revision SET DATA TYPE BIGINT, ALTER COLUMN prev_revision SET DATA TYPE BIGINT; ALTER SEQUENCE kine_id_seq AS BIGINT`,
 		// It is important to set the collation to "C" to ensure that LIKE and COMPARISON
@@ -696,7 +762,24 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 			}
 		}
 		logrus.Info("current-state table reads enabled (KINE_PGSQL_CURRENT_STATE): current GET/LIST/COUNT are served from kine_current; includeDeleted and revision-bounded reads remain on the history log")
-	} else if currentStateTeardown() && triggerInstalled(dialect.DB) {
+	}
+
+	// OPTIMIZATION_ROUND_20.md: fold the mirror-maintain trigger into the write
+	// statements. Runs AFTER setupCurrentState (which creates the trigger as
+	// part of the mirror schema) so the drop lands last; the trigger drop is
+	// unconditional under this flag, and ALL FOUR write statements are swapped
+	// (Insert/InsertCAS/PutOne/Fill) — un-swapped statements would leave the
+	// mirror unmaintained on their paths.
+	if inlineCurrentState() {
+		if _, err := dialect.DB.Exec(`DROP TRIGGER IF EXISTS kine_current_maintain ON kine`); err != nil {
+			return false, nil, fmt.Errorf("dropping kine_current_maintain for inline current state: %w", err)
+		}
+		inlineWriteStatements(dialect)
+		dialect.InlineCurrentState = true
+		logrus.Info("inline current state enabled (KINE_PGSQL_INLINE_CURRENT_STATE): mirror upserts are part of the write statements; trigger dropped")
+	}
+
+	if currentStateReads() == false && currentStateTeardown() && triggerInstalled(dialect.DB) {
 		// OPTIMIZATION_ROUND_9.md D4: with mirror reads disabled, an operator
 		// can request removal of the maintenance trigger so writes no longer
 		// pay for it. The mirror table itself is kept; re-enabling the flag
@@ -740,6 +823,26 @@ func skipNameIndex() bool {
 func oneStmtPutEnabled() bool {
 	v := os.Getenv("KINE_PGSQL_ONE_STMT_PUT")
 	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// inlineCurrentState reports whether the kine_current-maintain trigger should
+// be replaced by data-modifying CTEs on the write statements
+// (OPTIMIZATION_ROUND_20.md). Requires current state; aborts startup if the
+// trigger drop fails (a live trigger plus inline upserts would double-apply
+// the mirror maintenance).
+func inlineCurrentState() bool {
+	v := os.Getenv("KINE_PGSQL_INLINE_CURRENT_STATE")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// inlineWriteStatements swaps the four INSERT-bearing statements for their
+// CTE-inline mirror-upsert variants (OPTIMIZATION_ROUND_20.md). Statement
+// names (and therefore metrics/probes) are unchanged.
+func inlineWriteStatements(dialect *generic.Generic) {
+	dialect.InsertSQL = query.New(fmt.Sprintf(insertInlineFmt, insertCTEBodyFmt), "$", true, "Insert")
+	dialect.InsertCASSQL = query.New(fmt.Sprintf(insertCASInlineFmt, insertCASCTEBodyFmt), "$", true, "InsertCAS")
+	dialect.PutFast1SQL = query.New(fmt.Sprintf(putFast1InlineFmt, putFast1CTEBodyFmt), "$", true, "PutOne")
+	dialect.FillSQL = query.New(fmt.Sprintf(fillInlineFmt, fillCTEBodyFmt), "$", true, "Fill")
 }
 
 // nativeReads reports whether the pgx-native read path is enabled.
