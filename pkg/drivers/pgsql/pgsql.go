@@ -609,8 +609,18 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		}
 		return startKey
 	}
-	if err := setup(dialect.DB); err != nil {
+	if err := setup(dialect.DB, effectiveSchema()); err != nil {
 		return false, nil, err
+	}
+	if skipNameIndex() {
+		if _, err := dialect.DB.Exec(`DROP INDEX IF EXISTS kine_name_index`); err != nil {
+			return false, nil, fmt.Errorf("dropping redundant kine_name_index: %w", err)
+		}
+		logrus.Info("kine_name_index omitted and dropped (KINE_PGSQL_SKIP_NAME_INDEX): prefix-redundant with kine_name_id_index")
+	}
+	if barePutFastEnabled() {
+		dialect.BarePutFast = true
+		logrus.Info("bare-put fast path enabled (KINE_PGSQL_BARE_PUT_FAST): unconditional puts check and append in two statements (requires KINE_PGSQL_FUSED_CAS)")
 	}
 
 	// Fused CAS check-and-append (OPTIMIZATION_ROUND_17.md): opt-in via
@@ -667,6 +677,22 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 // replaces the read-then-insert CAS fast path (OPTIMIZATION_ROUND_17.md).
 func fusedCASEnabled() bool {
 	v := os.Getenv("KINE_PGSQL_FUSED_CAS")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// barePutFastEnabled reports whether the bare-put fast path (OPTIMIZATION_ROUND_18.md)
+// is requested; it additionally requires the fused CAS machinery (the update branch
+// of the fast path is the fused check-and-append statement).
+func barePutFastEnabled() bool {
+	v := os.Getenv("KINE_PGSQL_BARE_PUT_FAST")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// skipNameIndex reports whether the redundant kine_name_index should be omitted
+// from the schema and dropped if present (OPTIMIZATION_ROUND_18.md). (name) is a
+// strict prefix of (name, id); no kine query is better served by the narrow index.
+func skipNameIndex() bool {
+	v := os.Getenv("KINE_PGSQL_SKIP_NAME_INDEX")
 	return v == "true" || v == "1" || v == "TRUE"
 }
 
@@ -899,7 +925,24 @@ func openPgxPool(ctx context.Context, config *pgx.ConnConfig, connPoolConfig gen
 	return pool, nil
 }
 
-func setup(db *sql.DB) error {
+// effectiveSchema returns the schema statements to apply at startup: the full
+// list, or the list without the redundant kine_name_index when
+// KINE_PGSQL_SKIP_NAME_INDEX is set (OPTIMIZATION_ROUND_18.md).
+func effectiveSchema() []string {
+	if !skipNameIndex() {
+		return schema
+	}
+	stmts := make([]string, 0, len(schema))
+	for _, stmt := range schema {
+		if strings.Contains(stmt, "kine_name_index ON") {
+			continue
+		}
+		stmts = append(stmts, stmt)
+	}
+	return stmts
+}
+
+func setup(db *sql.DB, stmts []string) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")
 	var version string
 	collationSupported := true
@@ -910,7 +953,7 @@ func setup(db *sql.DB) error {
 		collationSupported = false
 	}
 
-	for _, stmt := range schema {
+	for _, stmt := range stmts {
 		if !collationSupported {
 			stmt = strings.ReplaceAll(stmt, ` COLLATE "C"`, "")
 		}

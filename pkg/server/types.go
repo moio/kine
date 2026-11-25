@@ -41,6 +41,16 @@ type Backend interface {
 	Compact(ctx context.Context, revision int64) (int64, error)
 }
 
+// FastPutter is the optional two-statement bare-put fast path of
+// OPTIMIZATION_ROUND_18.md: an unconditional put resolves in one existence
+// check plus one append (create or fused CAS update). done=false means the
+// fast path did not complete (race or capability disabled) and the caller
+// must run the standard create→get→update flow.
+type FastPutter interface {
+	BarePutFastEnabled() bool
+	PutFast(ctx context.Context, key string, value []byte, lease int64) (revision int64, prev *KeyValue, done bool, err error)
+}
+
 type Dialect interface {
 	ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (RowSet, error)
 	List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (RowSet, error)

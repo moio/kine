@@ -254,6 +254,75 @@ func (l *LogStructured) Update(ctx context.Context, key string, value []byte, re
 	return rev, updateEvent.KV, true, err
 }
 
+// BarePutFastEnabled reports whether PutFast may short-circuit unconditional
+// puts (OPTIMIZATION_ROUND_18.md): the dialect must opt in and the fused CAS
+// machinery must be available, since the update branch rides on UpdateCAS.
+func (l *LogStructured) BarePutFastEnabled() bool {
+	d, can := l.log.(interface{ BarePutFastEnabled() bool })
+	return can && d.BarePutFastEnabled()
+}
+
+// PutFast resolves an unconditional put in at most two SQL statements: one
+// tombstone-inclusive existence read, then either a create append or the fused
+// CAS append seeded with the revision the read returned. Any race or failed
+// capability returns done=false and the caller reruns the standard
+// create→get→update flow, which reproduces the original semantics exactly.
+// The failure KV contract mirrors the standard flow: the update branch returns
+// the appended row's KV (as Update does), the create branch returns nil prev
+// (as the Create path does).
+func (l *LogStructured) PutFast(ctx context.Context, key string, value []byte, lease int64) (revRet int64, prev *server.KeyValue, done bool, errRet error) {
+	defer func() {
+		l.adjustRevision(ctx, &revRet)
+		if logrus.IsLevelEnabled(logrus.TraceLevel) {
+			logrus.Tracef("PUTFAST %s, size=%d, lease=%v => rev=%d, done=%v, err=%v", key, len(value), lease, revRet, done, errRet)
+		}
+	}()
+
+	if !l.BarePutFastEnabled() {
+		return 0, nil, false, nil
+	}
+	cu, canCAS := l.log.(CASUpdater)
+	if !canCAS || !cu.CASFusable() {
+		return 0, nil, false, nil
+	}
+
+	_, event, err := l.get(ctx, key, 0, true, false)
+	if err != nil {
+		// surface read errors through the standard flow, which reports them identically
+		return 0, nil, false, nil
+	}
+
+	if event == nil || event.Delete {
+		// create branch: Create's own event construction verbatim
+		createEvent := &server.Event{
+			Create: true,
+			KV: &server.KeyValue{
+				Key:   key,
+				Value: value,
+				Lease: lease,
+			},
+			PrevKV: &server.KeyValue{},
+		}
+		if event != nil {
+			createEvent.PrevKV.ModRevision = event.KV.ModRevision
+		}
+		rev, err := l.log.Append(ctx, createEvent)
+		if err != nil {
+			// a lost create race (unique violation → ErrKeyExists) reruns the
+			// standard loop; other errors surface identically through it too
+			return 0, nil, false, nil
+		}
+		return rev, nil, true, nil
+	}
+
+	// live row: the read already provided everything the CAS needs
+	kv, updated, err := cu.UpdateCAS(ctx, key, value, event.KV.ModRevision, lease)
+	if err != nil || !updated {
+		return 0, nil, false, nil
+	}
+	return kv.ModRevision, kv, true, nil
+}
+
 func (l *LogStructured) Watch(ctx context.Context, revision int64) server.WatchResult {
 	// starting watching right away so we don't miss anything
 	ctx, cancel := context.WithCancel(ctx)

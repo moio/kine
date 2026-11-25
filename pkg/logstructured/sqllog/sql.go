@@ -834,6 +834,17 @@ func (s *SQLLog) CASFusable() bool {
 	return false
 }
 
+// BarePutFastEnabled forwards the dialect's bare-put fast-path opt-in
+// (OPTIMIZATION_ROUND_18.md); SQLLog has no statement of its own for it —
+// the fast path is one existence read (a plain log read) plus either an
+// ordinary Append (create branch) or UpdateCAS (update branch).
+func (s *SQLLog) BarePutFastEnabled() bool {
+	if d, can := s.d.(interface{ BarePutFastEnabled() bool }); can {
+		return d.BarePutFastEnabled()
+	}
+	return false
+}
+
 // UpdateCAS performs the fused check-and-append for a supported CAS update;
 // on success it returns the updated KV (ModRevision = new revision,
 // CreateRevision from the appended row). ok=false means the CAS check did

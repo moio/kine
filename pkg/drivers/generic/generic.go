@@ -114,6 +114,10 @@ type Generic struct {
 	// FusedCAS is the operator opt-in switch (KINE_PGSQL_FUSED_CAS).
 	InsertCASSQL *query.Named
 	FusedCAS     bool
+	// BarePutFast is the operator opt-in switch for the bare-put fast path
+	// (KINE_PGSQL_BARE_PUT_FAST, OPTIMIZATION_ROUND_18.md): unconditional
+	// puts collapse to two statements. Requires the fused statement.
+	BarePutFast bool
 	GetSizeSQL              *query.Named
 	Retry                   ErrRetry
 	InsertRetry             ErrRetry
@@ -877,6 +881,10 @@ func (d *Generic) Insert(ctx context.Context, key string, create, delete bool, c
 // is active: the dialect must ship the fused statement and the operator
 // must have opted in (KINE_PGSQL_FUSED_CAS).
 func (d *Generic) FusedCASEnabled() bool { return d.FusedCAS && d.InsertCASSQL != nil }
+
+// BarePutFastEnabled reports whether the bare-put fast path (two statements per
+// unconditional put) is active. It rides entirely on the fused CAS machinery.
+func (d *Generic) BarePutFastEnabled() bool { return d.BarePutFast && d.InsertCASSQL != nil }
 
 // InsertCAS performs the fused CAS check-and-append (OPTIMIZATION_ROUND_17.md):
 // one INSERT...SELECT statement verifies that the key's latest row (MAX(id)
