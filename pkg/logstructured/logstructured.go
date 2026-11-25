@@ -3,12 +3,21 @@ package logstructured
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/k3s-io/kine/pkg/ttl"
 )
+
+// OneStmtPutter is the one-statement bare-put capability of
+// OPTIMIZATION_ROUND_19.md, implemented by logs over backends that can
+// classify the key and append the successor in one statement (PostgreSQL).
+type OneStmtPutter interface {
+	OneStmtPutEnabled() bool
+	PutOne(ctx context.Context, key string, value []byte, lease int64) (revision, prevRevision, createRevision int64, err error)
+}
 
 type Log interface {
 	Start(ctx context.Context) error
@@ -260,6 +269,32 @@ func (l *LogStructured) Update(ctx context.Context, key string, value []byte, re
 func (l *LogStructured) BarePutFastEnabled() bool {
 	d, can := l.log.(interface{ BarePutFastEnabled() bool })
 	return can && d.BarePutFastEnabled()
+}
+
+// OneStmtPutEnabled reports whether Put may resolve in a single statement
+// (OPTIMIZATION_ROUND_19.md); forwarded to the backing log like every
+// capability on this type.
+func (l *LogStructured) OneStmtPutEnabled() bool {
+	d, can := l.log.(interface{ OneStmtPutEnabled() bool })
+	return can && d.OneStmtPutEnabled()
+}
+
+// PutOne performs the one-statement bare put (OPTIMIZATION_ROUND_19.md) and
+// mirrors the success-KV contract of the standard loop: loop-entered successes
+// (prevRevision != 0, i.e. create-after-tombstone or update) carry the new KV
+// chain values, first-ever creates return createRevision = 0.
+func (l *LogStructured) PutOne(ctx context.Context, key string, value []byte, lease int64) (revision, prevRevision, createRevision int64, err error) {
+	defer func() {
+		l.adjustRevision(ctx, &revision)
+		if logrus.IsLevelEnabled(logrus.TraceLevel) {
+			logrus.Tracef("PUTONE %s, size=%d, lease=%v => rev=%d, prev=%d, createrev=%d, err=%v", key, len(value), lease, revision, prevRevision, createRevision, err)
+		}
+	}()
+	osp, can := l.log.(OneStmtPutter)
+	if !can {
+		return 0, 0, 0, fmt.Errorf("one-statement put not supported by this log")
+	}
+	return osp.PutOne(ctx, key, value, lease)
 }
 
 // PutFast resolves an unconditional put in at most two SQL statements: one

@@ -206,6 +206,40 @@ var (
 		WHERE cur.deleted = 0 AND cur.id = $2
 		RETURNING id, create_revision`
 
+	// One-statement bare put (OPTIMIZATION_ROUND_19.md,
+	// KINE_PGSQL_ONE_STMT_PUT): the whole put decision — create, create over
+	// tombstone, or CAS update — collapses into this INSERT … SELECT. The
+	// RIGHT JOIN (VALUES (1)) turns a zero-row check subquery into one all-NULL
+	// row so the absent-key branch still inserts. The (name, prev_revision)
+	// unique index arbitrates every branch: first-create proposes (name, 0),
+	// create-over-tombstone proposes (name, tombstone id), update proposes
+	// (name, latest id) — exactly one concurrent put of the same base state
+	// commits; losers receive a unique violation (ErrKeyExists), which the
+	// caller turns into the standard put loop (last-writer-wins preserved).
+	// RETURNING gives the new revision plus what put.go needs to reproduce
+	// the response exactly: prev_revision = 0 identifies a first-ever create
+	// (the only success path whose PrevKv is nil); anything else returns the
+	// new KV, reconstructed caller-side from (key, value, lease, mod=RETURNING
+	// id, createRev=RETURNING create_revision).
+	putFast1Fmt = `
+		INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+		SELECT $1,
+		       CASE WHEN cur.id IS NULL OR cur.deleted = 1 THEN 1 ELSE 0 END,
+		       0,
+		       CASE
+		         WHEN cur.id IS NULL OR cur.deleted = 1 THEN 0
+		         WHEN cur.created = 1 THEN cur.id
+		         ELSE cur.create_revision
+		       END,
+		       COALESCE(cur.id, 0),
+		       $3, $2,
+		       CASE WHEN cur.id IS NULL OR cur.deleted = 1 THEN NULL ELSE cur.value END
+		FROM (SELECT id, created, deleted, create_revision, value
+		      FROM kine
+		      WHERE id = (SELECT MAX(id) FROM kine WHERE name = $1)) cur
+		RIGHT JOIN (VALUES (1)) AS keep ON true
+		RETURNING id, prev_revision, create_revision`
+
 	schemaMigrations = []string{
 		`ALTER TABLE kine ALTER COLUMN id SET DATA TYPE BIGINT, ALTER COLUMN create_revision SET DATA TYPE BIGINT, ALTER COLUMN prev_revision SET DATA TYPE BIGINT; ALTER SEQUENCE kine_id_seq AS BIGINT`,
 		// It is important to set the collation to "C" to ensure that LIKE and COMPARISON
@@ -622,6 +656,11 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		dialect.BarePutFast = true
 		logrus.Info("bare-put fast path enabled (KINE_PGSQL_BARE_PUT_FAST): unconditional puts check and append in two statements (requires KINE_PGSQL_FUSED_CAS)")
 	}
+	if oneStmtPutEnabled() {
+		dialect.PutFast1SQL = query.New(putFast1Fmt, "$", true, "PutOne")
+		dialect.OneStmtPut = true
+		logrus.Info("one-statement bare put enabled (KINE_PGSQL_ONE_STMT_PUT): create/update/tombstone decisions collapse into one INSERT statement")
+	}
 
 	// Fused CAS check-and-append (OPTIMIZATION_ROUND_17.md): opt-in via
 	// KINE_PGSQL_FUSED_CAS. The statement arbitrates racing writers with the
@@ -693,6 +732,13 @@ func barePutFastEnabled() bool {
 // strict prefix of (name, id); no kine query is better served by the narrow index.
 func skipNameIndex() bool {
 	v := os.Getenv("KINE_PGSQL_SKIP_NAME_INDEX")
+	return v == "true" || v == "1" || v == "TRUE"
+}
+
+// oneStmtPutEnabled reports whether the one-statement bare put replaces the
+// two-statement fast path (OPTIMIZATION_ROUND_19.md).
+func oneStmtPutEnabled() bool {
+	v := os.Getenv("KINE_PGSQL_ONE_STMT_PUT")
 	return v == "true" || v == "1" || v == "TRUE"
 }
 

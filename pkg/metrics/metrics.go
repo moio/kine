@@ -52,6 +52,11 @@ var (
 		Name: "kine_fused_cas_total",
 		Help: "Fused CAS check-and-append outcomes (OPTIMIZATION_ROUND_17.md): success, conflict (arbiter unique violation), no_match (check did not hold)",
 	}, []string{"result"})
+
+	PutOne = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kine_put_one_total",
+		Help: "One-statement bare put outcomes (OPTIMIZATION_ROUND_19.md): success, conflict (arbiter unique violation, caller falls back to the standard loop)",
+	}, []string{"result"})
 )
 
 var (

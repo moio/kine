@@ -24,6 +24,39 @@ func (l *LimitedServer) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*e
 
 	key := string(r.Key)
 
+	// OPTIMIZATION_ROUND_19.md: the one-statement bare put, when supported,
+	// resolves the whole put in a single statement. ErrKeyExists (lost arbiter
+	// race) falls through to the standard create→get→update loop, which is
+	// also how the standard path behaves on a lost race.
+	if osp, ok := l.backend.(OneStmtPutter); ok && osp.OneStmtPutEnabled() {
+		rev, prevRev, createRev, err := osp.PutOne(ctx, key, r.Value, r.Lease)
+		if err == nil {
+			var kv *KeyValue
+			if prevRev != 0 {
+				// loop-entered success: the standard path returns the new KV
+				// as PrevKv; a first-ever create (prevRev == 0) returns nil
+				kv = &KeyValue{
+					Key:            key,
+					Value:          r.Value,
+					Lease:          r.Lease,
+					ModRevision:    rev,
+					CreateRevision: createRev,
+				}
+			}
+			if !r.PrevKv {
+				kv = nil
+			}
+			return &etcdserverpb.PutResponse{
+				Header: &etcdserverpb.ResponseHeader{Revision: rev},
+				PrevKv: toKV(kv),
+			}, nil
+		}
+		if err != ErrKeyExists {
+			return nil, err
+		}
+		// lost race → standard loop handles it identically
+	}
+
 	// OPTIMIZATION_ROUND_18.md: when the backend supports the two-statement
 	// bare-put fast path, try it first. done=false (race, capability off or
 	// read error) falls through to the standard create→get→update loop, which

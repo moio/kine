@@ -845,6 +845,36 @@ func (s *SQLLog) BarePutFastEnabled() bool {
 	return false
 }
 
+// OneStmtPutter is the one-statement bare-put capability of
+// OPTIMIZATION_ROUND_19.md, overriding BarePutFast when enabled.
+type OneStmtPutter interface {
+	OneStmtPutEnabled() bool
+	PutOne(ctx context.Context, key string, value []byte, lease int64) (id, prevRevision, createRevision int64, err error)
+}
+
+// OneStmtPutEnabled forwards the dialect's one-statement put opt-in.
+func (s *SQLLog) OneStmtPutEnabled() bool {
+	if d, can := s.d.(interface{ OneStmtPutEnabled() bool }); can {
+		return d.OneStmtPutEnabled()
+	}
+	return false
+}
+
+// PutOne performs the one-statement bare put and publishes the new revision to
+// the poller exactly as Append does.
+func (s *SQLLog) PutOne(ctx context.Context, key string, value []byte, lease int64) (id, prevRevision, createRevision int64, err error) {
+	osp, can := s.d.(OneStmtPutter)
+	if !can {
+		return 0, 0, 0, errors.New("one-statement put not supported by this log")
+	}
+	id, prevRevision, createRevision, err = osp.PutOne(ctx, key, value, lease)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	s.appended(s.currentRev.Load(), id)
+	return id, prevRevision, createRevision, nil
+}
+
 // UpdateCAS performs the fused check-and-append for a supported CAS update;
 // on success it returns the updated KV (ModRevision = new revision,
 // CreateRevision from the appended row). ok=false means the CAS check did

@@ -118,13 +118,19 @@ type Generic struct {
 	// (KINE_PGSQL_BARE_PUT_FAST, OPTIMIZATION_ROUND_18.md): unconditional
 	// puts collapse to two statements. Requires the fused statement.
 	BarePutFast bool
-	GetSizeSQL              *query.Named
-	Retry                   ErrRetry
-	InsertRetry             ErrRetry
-	TranslateErr            TranslateErr
-	TranslateStartKeyFunc   SubstituteFunc
-	ErrCode                 ErrCode
-	FillRetryDuration       time.Duration
+	// OneStmtPut is the operator opt-in switch for the one-statement bare
+	// put (KINE_PGSQL_ONE_STMT_PUT, OPTIMIZATION_ROUND_19.md). Requires the
+	// one-statement put (PutFast1SQL != nil); strictly stronger than
+	// BarePutFast (which remains the fallback path).
+	OneStmtPut  bool
+	PutFast1SQL *query.Named
+	GetSizeSQL            *query.Named
+	Retry                 ErrRetry
+	InsertRetry           ErrRetry
+	TranslateErr          TranslateErr
+	TranslateStartKeyFunc SubstituteFunc
+	ErrCode               ErrCode
+	FillRetryDuration     time.Duration
 
 	// --- cached revision substitution (OPTIMIZATION_ROUND_1.md T3) ---
 	// Every read query embeds two scalar subqueries: the current revision
@@ -885,6 +891,45 @@ func (d *Generic) FusedCASEnabled() bool { return d.FusedCAS && d.InsertCASSQL !
 // BarePutFastEnabled reports whether the bare-put fast path (two statements per
 // unconditional put) is active. It rides entirely on the fused CAS machinery.
 func (d *Generic) BarePutFastEnabled() bool { return d.BarePutFast && d.InsertCASSQL != nil }
+
+// OneStmtPutEnabled reports whether the one-statement bare put is active
+// (OPTIMIZATION_ROUND_19.md). Strictly stronger than BarePutFastEnabled.
+func (d *Generic) OneStmtPutEnabled() bool { return d.OneStmtPut && d.PutFast1SQL != nil }
+
+// PutOne is the one-statement bare put (OPTIMIZATION_ROUND_19.md): the create,
+// create-over-tombstone and CAS-update decisions collapse into one INSERT …
+// SELECT, arbitrated by the (name, prev_revision) unique index. It returns the
+// new revision, the base revision it built on (0 = first-ever create) and the
+// new row's create_revision. A lost race (arbiter violation) surfaces as
+// server.ErrKeyExists so the caller can run the standard put loop, exactly like
+// a lost Append race; kine_pkey collisions (sequence raced a gap fill) retry
+// like Insert. The statement returns exactly one row on success.
+func (d *Generic) PutOne(ctx context.Context, key string, value []byte, lease int64) (id, prevRevision, createRevision int64, err error) {
+	wait := strategy.Backoff(backoff.Linear(100 * time.Millisecond))
+	for i := uint(0); i < 20; i++ {
+		row := d.queryRow(ctx, d.PutFast1SQL, key, value, lease)
+		err = row.Scan(&id, &prevRevision, &createRevision)
+		if err != nil && d.InsertRetry != nil && d.InsertRetry(err) {
+			logrus.Warnf("Retriable insert error for key %v: %v", key, err)
+			metrics.InsertErrorsTotal.WithLabelValues("true").Inc()
+			wait(i)
+			continue
+		}
+		if err != nil && d.TranslateErr != nil && errors.Is(d.TranslateErr(err), server.ErrKeyExists) {
+			// lost the race on the arbiter index
+			metrics.PutOne.WithLabelValues("conflict").Inc()
+			return 0, 0, 0, server.ErrKeyExists
+		}
+		if err != nil {
+			metrics.InsertErrorsTotal.WithLabelValues("false").Inc()
+			logrus.WithField("key", key).Errorf("PutOne error for key %v: %v", key, err)
+			return 0, 0, 0, err
+		}
+		metrics.PutOne.WithLabelValues("success").Inc()
+		return id, prevRevision, createRevision, nil
+	}
+	return
+}
 
 // InsertCAS performs the fused CAS check-and-append (OPTIMIZATION_ROUND_17.md):
 // one INSERT...SELECT statement verifies that the key's latest row (MAX(id)

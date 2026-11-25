@@ -67,7 +67,8 @@ func consume(rs interface {
 	Binary() bool
 	Close()
 	Err() error
-}) (key string, modrev int64, ok bool) {
+},
+) (key string, modrev int64, ok bool) {
 	if !rs.Next() {
 		return "", 0, false
 	}

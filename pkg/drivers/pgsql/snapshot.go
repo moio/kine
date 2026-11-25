@@ -34,10 +34,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/k3s-io/kine/pkg/tls"
 	"github.com/sirupsen/logrus"
-	"github.com/jackc/pgx/v5"
 )
 
 const snapshotEnvDSN = "KINE_SNAPSHOT_LOAD_DSN"

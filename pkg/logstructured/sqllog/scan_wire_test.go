@@ -115,8 +115,10 @@ func binRow(cur, compact, modrev int64, name string, created, deleted, createRev
 		binary.BigEndian.PutUint32(b, uint32(v))
 		return b
 	}
-	raws := [][]byte{i8(cur), i8(compact), i8(modrev), []byte(name),
-		i4(created), i4(deleted), i8(createRev), i8(prevMod), i4(lease)}
+	raws := [][]byte{
+		i8(cur), i8(compact), i8(modrev), []byte(name),
+		i4(created), i4(deleted), i8(createRev), i8(prevMod), i4(lease),
+	}
 	raws = append(raws, val, prev)
 	return raws
 }

@@ -51,6 +51,15 @@ type FastPutter interface {
 	PutFast(ctx context.Context, key string, value []byte, lease int64) (revision int64, prev *KeyValue, done bool, err error)
 }
 
+// OneStmtPut is the optional one-statement bare put of OPTIMIZATION_ROUND_19.md
+// (strictly stronger than FastPutter): one statement classifies the key and
+// appends the successor, arbitrated by the backend's unique index. A returned
+// ErrKeyExists (or any other error) is handled by the caller's standard loop.
+type OneStmtPutter interface {
+	OneStmtPutEnabled() bool
+	PutOne(ctx context.Context, key string, value []byte, lease int64) (revision, prevRevision, createRevision int64, err error)
+}
+
 type Dialect interface {
 	ListCurrent(ctx context.Context, key, end string, limit int64, includeDeleted, keysOnly bool) (RowSet, error)
 	List(ctx context.Context, key, end string, limit, revision int64, includeDeleted, keysOnly bool) (RowSet, error)
